@@ -78,6 +78,8 @@ class NormalizedEvent:
     host: str | None = None
     process: str | None = None
     parent_process: str | None = None
+    process_id: int | None = None
+    parent_process_id: int | None = None
     command_line: str | None = None
     source_ip: str | None = None
     destination_ip: str | None = None
@@ -173,6 +175,7 @@ def _parse_linux_sshd(raw: RawEvent) -> dict[str, Any]:
         "host": _short_hostname(raw.get("host")),
         "source_ip": _clean(raw.get("src_ip")),
         "process": _clean(raw.get("program")),
+        "process_id": _to_int(raw.get("pid")),
         "result": results[raw["event"]],
     }
 
@@ -196,6 +199,8 @@ def _parse_linux_edr(raw: RawEvent) -> dict[str, Any]:
         "host": _short_hostname(raw.get("hostname")),
         "process": _clean(raw.get("exe_path")),
         "parent_process": _clean(raw.get("parent_exe_path")),
+        "process_id": _to_int(raw.get("pid")),
+        "parent_process_id": _to_int(raw.get("ppid")),
         "command_line": _clean(raw.get("cmdline")),
         "file_path": _clean(raw.get("target_path")),
         "source_ip": _clean(raw.get("local_ip")),
@@ -254,6 +259,8 @@ def _parse_sysmon(raw: RawEvent) -> dict[str, Any]:
         "host": _short_hostname(raw.get("Computer")),
         "process": _clean(raw.get("Image")),
         "parent_process": _clean(raw.get("ParentImage")),
+        "process_id": _to_int(raw.get("ProcessId")),
+        "parent_process_id": _to_int(raw.get("ParentProcessId")),
         "command_line": _clean(raw.get("CommandLine")),
         "source_ip": _clean(raw.get("SourceIp")),
         "destination_ip": _clean(raw.get("DestinationIp")),
