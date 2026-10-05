@@ -1,8 +1,12 @@
 """SecOps Automation Lab - CLI.
 
 Loads simulated security telemetry, normalizes it, prints a chronological
-timeline and runs behavioral detections. Normalized events and detections can
-be inspected individually or exported to JSON.
+timeline, runs behavioral detections and enriches them with MITRE ATT&CK
+mappings and threat intelligence. Normalized events and detections can be
+inspected individually or exported to JSON.
+
+By default threat intelligence comes from an offline mock provider: no network
+requests are made unless a real provider is explicitly selected.
 """
 
 from __future__ import annotations
@@ -14,13 +18,24 @@ import textwrap
 from pathlib import Path
 
 from src.detection_engine import Detection, run_detections
+from src.enrichment import EnrichedDetection, enrich_detections
 from src.normalizer import NormalizedEvent, normalize_events
+from src.threat_intel import (
+    ABUSEIPDB_API_KEY_ENV,
+    AbuseIPDBProvider,
+    CachedThreatIntel,
+    MissingApiKeyError,
+    MockThreatIntelProvider,
+    ThreatIntelResult,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = PROJECT_ROOT / "data" / "security_events.json"
 DEFAULT_EXPORT = PROJECT_ROOT / "output" / "normalized_events.json"
 DETECTIONS_EXPORT = PROJECT_ROOT / "output" / "detections.json"
 LINE_WIDTH = 72
+
+THREAT_INTEL_CHOICES = ("mock", "abuseipdb")
 
 # Which normalized fields to show in the timeline, per event type.
 SUMMARY_FIELDS = {
@@ -53,8 +68,8 @@ def format_event(event: NormalizedEvent) -> str:
     return "\n".join([header, *details])
 
 
-def _wrap(text: str) -> str:
-    return textwrap.fill(text, width=LINE_WIDTH, initial_indent="    ", subsequent_indent="    ")
+def _wrap(text: str, indent: str = "    ") -> str:
+    return textwrap.fill(text, width=LINE_WIDTH, initial_indent=indent, subsequent_indent=indent)
 
 
 def format_detection(detection: Detection) -> str:
@@ -89,11 +104,44 @@ def format_detection(detection: Detection) -> str:
     return "\n".join(lines)
 
 
+def format_threat_intel_result(result: ThreatIntelResult) -> list[str]:
+    label = "  [SIMULATED]" if result.simulated else ""
+    lines = [f"    Indicator:  {result.indicator}{label}", f"    Reputation: {result.reputation}"]
+    if result.error:
+        lines.append(f"    Lookup:     failed - {result.error}")
+    else:
+        confidence = f"{result.confidence:.2f}" if result.confidence is not None else "-"
+        lines += [f"    Confidence: {confidence}", f"    Tags:       {', '.join(result.tags) or '-'}"]
+        note = result.details.get("note")
+        if note:
+            lines.append(f"    Note:       {note}")
+    lines.append(f"    Source:     {result.source}")
+    return lines
+
+
+def format_enrichment(enriched: EnrichedDetection) -> str:
+    lines = ["", "  MITRE ATT&CK:"]
+    if not enriched.mitre_techniques:
+        lines.append("    (no technique mapping supported by the evidence)")
+    for technique in enriched.mitre_techniques:
+        lines.append(f"    {technique.technique_id} - {technique.technique_name}")
+        lines.append(_wrap("Reason: " + technique.reason, indent="      "))
+
+    lines += ["", "  Threat Intelligence (context, not proof of compromise):", _wrap("Status: " + enriched.threat_intel_status)]
+    if not enriched.threat_intel:
+        lines.append("    (no indicators enriched)")
+    for index, result in enumerate(enriched.threat_intel):
+        if index:
+            lines.append("")
+        lines += format_threat_intel_result(result)
+    return "\n".join(lines)
+
+
 def print_banner() -> None:
     line = "=" * LINE_WIDTH
     print(line)
     print("SECOPS AUTOMATION LAB".center(LINE_WIDTH))
-    print("Normalization and behavioral detection".center(LINE_WIDTH))
+    print("Normalization, detection and enrichment".center(LINE_WIDTH))
     print(line)
 
 
@@ -111,24 +159,62 @@ def print_timeline(events: list[NormalizedEvent]) -> None:
         print(f"    {event_type:<18} {count}")
 
 
-def print_detections(detections: list[Detection]) -> None:
+def print_detections(enriched_detections: list[EnrichedDetection]) -> None:
     line = "=" * LINE_WIDTH
     print(f"\n{line}\n{'DETECTIONS'.center(LINE_WIDTH)}\n{line}\n")
-    if not detections:
+    if not enriched_detections:
         print("No detections.")
         return
-    for detection in detections:
-        print(format_detection(detection))
+    for enriched in enriched_detections:
+        print(format_detection(enriched.detection))
+        print(format_enrichment(enriched))
         print("-" * LINE_WIDTH)
         print()
-    print(f"[+] {len(detections)} detection(s)")
+    print(f"[+] {len(enriched_detections)} detection(s)")
 
 
-def inspect(input_path: Path, record_id: str) -> int:
-    """Print the normalized event or detection with this ID as JSON."""
+def build_threat_intel(choice: str) -> tuple[CachedThreatIntel | None, str | None]:
+    """Return ``(intel, None)`` or ``(None, reason)`` when the provider cannot be used.
+
+    Only the mock provider is used unless the user explicitly asks for another.
+    """
+    if choice == "mock":
+        return CachedThreatIntel(MockThreatIntelProvider()), None
+    try:
+        return CachedThreatIntel(AbuseIPDBProvider.from_environment()), None
+    except MissingApiKeyError:
+        return None, f"{ABUSEIPDB_API_KEY_ENV} is not set, so AbuseIPDB was NOT queried"
+
+
+def describe_provider(intel: CachedThreatIntel | None, disabled_reason: str | None) -> str:
+    if intel is None:
+        return f"[!] Threat intelligence disabled: {disabled_reason}."
+    if intel.provider.simulated:
+        return f"[+] Threat intelligence: {intel.provider.name} - offline, no network requests"
+    return (
+        f"[!] Threat intelligence: {intel.provider.name} (REAL external API). Only public IPs from detections\n"
+        f"    are sent to the provider's API; no other host is contacted."
+    )
+
+
+def lookup_single_ip(choice: str, ip: str) -> int:
+    intel, disabled_reason = build_threat_intel(choice)
+    print(describe_provider(intel, disabled_reason))
+    if intel is None:
+        return 2
+    print()
+    print("\n".join(format_threat_intel_result(intel.lookup_ip(ip))))
+    return 0
+
+
+def inspect(input_path: Path, record_id: str, choice: str) -> int:
+    """Print the normalized event or (enriched) detection with this ID as JSON."""
     events, _ = normalize_events(load_events(input_path))
-    records: dict[str, NormalizedEvent | Detection] = {event.event_id: event for event in events}
-    records.update({detection.detection_id: detection for detection in run_detections(events)})
+    records: dict[str, NormalizedEvent | EnrichedDetection] = {event.event_id: event for event in events}
+    detections = [d for d in run_detections(events) if d.detection_id == record_id]
+    if detections:  # only enrich (and possibly query a provider) when a detection was asked for
+        intel, disabled_reason = build_threat_intel(choice)
+        records[record_id] = enrich_detections(detections, intel, disabled_reason)[0]
     if record_id not in records:
         print(f"[!] No event or detection with id {record_id}", file=sys.stderr)
         return 1
@@ -143,21 +229,33 @@ def export(path: Path, records: list[dict]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Normalize simulated security telemetry and run detections.")
+    parser = argparse.ArgumentParser(description="Normalize simulated security telemetry, detect and enrich.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="raw events JSON file")
     parser.add_argument(
         "--inspect", metavar="ID", help="print one normalized event (event ID) or detection (DET-...) in full"
     )
     parser.add_argument("--no-timeline", action="store_true", help="skip the event timeline, show detections only")
     parser.add_argument("--export", action="store_true", help="write normalized events and detections to output/")
+    parser.add_argument(
+        "--threat-intel",
+        choices=THREAT_INTEL_CHOICES,
+        default="mock",
+        help="threat-intelligence provider (default: mock, offline). 'abuseipdb' makes real API "
+        f"requests and needs {ABUSEIPDB_API_KEY_ENV}",
+    )
+    parser.add_argument(
+        "--lookup-ip", metavar="IP", help="look up a single IP with the selected provider and exit"
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
+    if args.lookup_ip:
+        return lookup_single_ip(args.threat_intel, args.lookup_ip)
     if args.inspect:
-        return inspect(args.input, args.inspect)
+        return inspect(args.input, args.inspect, args.threat_intel)
 
     print_banner()
     print("\n[+] Loading security telemetry...")
@@ -175,12 +273,20 @@ def main() -> int:
 
     print("\n[+] Running detections...")
     detections = run_detections(events)
-    print_detections(detections)
+
+    intel, disabled_reason = build_threat_intel(args.threat_intel)
+    print(describe_provider(intel, disabled_reason))
+    if intel is None:
+        print("    Detections and ATT&CK mapping still run.")
+    enriched_detections = enrich_detections(detections, intel, disabled_reason)
+    print_detections(enriched_detections)
+    if intel is not None:
+        print(f"[+] Threat intel: {intel.provider_calls} provider lookup(s), {intel.cache_hits} served from cache")
 
     if args.export:
         print()
         export(DEFAULT_EXPORT, [event.to_dict() for event in events])
-        export(DETECTIONS_EXPORT, [detection.to_dict() for detection in detections])
+        export(DETECTIONS_EXPORT, [enriched.to_dict() for enriched in enriched_detections])
 
     print("\nTip: python main.py --inspect <event-id | DET-id> shows the full record.")
     return 0

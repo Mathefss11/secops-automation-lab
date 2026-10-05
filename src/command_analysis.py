@@ -11,6 +11,7 @@ import base64
 import binascii
 import re
 import shlex
+from urllib.parse import urlsplit
 
 POWERSHELL_IMAGES = {"powershell.exe", "pwsh.exe"}
 OFFICE_IMAGES = {"winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe", "msaccess.exe"}
@@ -151,3 +152,15 @@ def get_chmod_execute_targets(command_line: str | None) -> list[str]:
     if len(arguments) < 2 or not _mode_adds_execute(arguments[0]):
         return []
     return arguments[1:]
+
+
+def get_url_hosts(command_line: str | None) -> list[str]:
+    """Hostnames/IPs of http(s)/ftp URLs in a command line (parsing only;
+    nothing is fetched)."""
+    hosts = []
+    for token in _split_shell(command_line):
+        if token.lower().startswith(("http://", "https://", "ftp://")):
+            host = urlsplit(token).hostname
+            if host and host not in hosts:
+                hosts.append(host)
+    return hosts

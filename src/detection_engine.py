@@ -137,7 +137,7 @@ INTERNAL_NETWORKS = [
 ]
 
 
-def _is_external_ip(ip: str | None) -> bool:
+def is_external_ip(ip: str | None) -> bool:
     """True if ``ip`` is a valid address outside ``INTERNAL_NETWORKS``."""
     if not ip:
         return False
@@ -295,7 +295,7 @@ def _credential_detection(
     success: NormalizedEvent, failures: list[NormalizedEvent], accounts: list[str]
 ) -> Detection:
     signals = []
-    if _is_external_ip(success.source_ip):
+    if is_external_ip(success.source_ip):
         signals.append("external_source")
     if success.user in accounts:
         signals.append("failed_account_later_succeeded")
@@ -399,7 +399,7 @@ def _powershell_activity(
     connections = [
         e
         for e in later
-        if e.event_type == NETWORK_CONNECTION and _same_process(e, process) and _is_external_ip(e.destination_ip)
+        if e.event_type == NETWORK_CONNECTION and _same_process(e, process) and is_external_ip(e.destination_ip)
     ]
     created_files = [e for e in later if e.event_type == FILE_CREATE and _same_process(e, process)]
     created_paths = {e.file_path.lower() for e in created_files if e.file_path}
@@ -409,7 +409,7 @@ def _powershell_activity(
         for e in later
         if e.event_type == NETWORK_CONNECTION
         and any(_same_process(e, child) for child in executed)
-        and _is_external_ip(e.destination_ip)
+        and is_external_ip(e.destination_ip)
     ]
 
     if queries:
@@ -436,6 +436,9 @@ def _powershell_activity(
     details = {
         "dns_queries": [e.dns_query for e in queries],
         "external_destinations": [f"{e.destination_ip}:{e.destination_port}" for e in connections + executed_connections],
+        # All external IPs, and the subset contacted by the PowerShell process itself.
+        "external_ips": _unique_in_order([e.destination_ip for e in connections + executed_connections]),
+        "powershell_external_ips": _unique_in_order([e.destination_ip for e in connections]),
         "created_files": [e.file_path for e in created_files],
         "executed_files": [e.process for e in executed],
     }
@@ -634,7 +637,7 @@ def _payload_detection(
         if e.event_type == NETWORK_CONNECTION
         and _same_process(e, execution)
         and _in_window(e, execution, window)
-        and _is_external_ip(e.destination_ip)
+        and is_external_ip(e.destination_ip)
     ]
 
     signals = []
@@ -692,7 +695,9 @@ def _payload_detection(
             "download_event": download.event_id,
             "permission_events": [e.event_id for e in permission_changes],
             "execution_event": execution.event_id,
+            "execution_parent_process": execution.parent_process,
             "network_events": [e.event_id for e in connections],
+            "external_ips": _unique_in_order([e.destination_ip for e in connections]),
             "elapsed_seconds_download_to_execution": elapsed,
         },
         false_positives=PAYLOAD_FALSE_POSITIVES,

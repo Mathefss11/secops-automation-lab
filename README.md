@@ -8,8 +8,9 @@ It is built in phases. The current version covers:
 
 - **Phase 1**: simulated security telemetry, event normalization and a CLI timeline
 - **Phase 2**: a behavioral detection engine that correlates normalized events into explainable detections
+- **Phase 3**: evidence-based MITRE ATT&CK mapping and threat-intelligence enrichment (offline mock by default, optional real AbuseIPDB API)
 
-There is no web UI, database, cloud service or external API.
+There is no web UI, database or cloud service. The only external API is optional and is never contacted unless explicitly requested.
 
 ## Goals
 
@@ -20,18 +21,22 @@ The lab is meant to demonstrate, step by step:
 - **Detection engineering**: writing detection logic against normalized events
 - **Security automation**: enrichment, risk scoring and SOAR-style response
 
-Telemetry, normalization and behavioral detection exist now. Later phases will add MITRE ATT&CK mapping, threat-intelligence enrichment, risk scoring and simulated SOAR-style response. None of those are implemented yet.
+Telemetry, normalization, behavioral detection, ATT&CK mapping and threat-intelligence enrichment exist now. Later phases will add risk scoring and simulated SOAR-style response. Neither is implemented yet.
 
 ## Current Architecture
 
 ```
-Simulated Telemetry   (data/security_events.json)
-        ↓
-Normalization         (src/normalizer.py)
-        ↓
-Detection Engine      (src/detection_engine.py, src/command_analysis.py)
-        ↓
-Detection Evidence    (CLI timeline + detections, main.py)
+Telemetry                          data/security_events.json
+   ↓
+Normalization                      src/normalizer.py
+   ↓
+Detection Engine                   src/detection_engine.py, src/command_analysis.py
+   ↓
+Detection
+   ├── MITRE ATT&CK Mapping        src/mitre.py
+   └── Threat Intelligence         src/threat_intel.py
+            ↓
+      Enriched Detection           src/enrichment.py → CLI / JSON export (main.py)
 ```
 
 ## Why Normalize Security Events?
@@ -178,6 +183,72 @@ Correlation reduces false positives. It does not eliminate them. Every detection
 
 The bundled dataset includes benign versions of these behaviors: a mistyped Windows password, admin PowerShell, a local `curl` health check, `apt-get update` and `git pull`. The tests check that none of them trigger a detection.
 
+## MITRE ATT&CK Mapping
+
+[MITRE ATT&CK](https://attack.mitre.org/) is a public knowledge base of adversary behaviors, organized as tactics (the goal) and techniques (how the goal is reached). Mapping a detection to techniques gives analysts a shared vocabulary, links to documented procedures and mitigations, and a way to see which behaviors detection logic covers.
+
+A mapping means "the observed activity matches this documented behavior". It does **not** prove malicious intent, and ATT&CK is **not** a severity scale. Mapping never changes a detection's severity or confidence.
+
+`src/mitre.py` adds a technique **only when specific evidence in the detection supports it**, and each mapping's `reason` cites that evidence. Technique IDs and names were checked against attack.mitre.org on 2026-10-05.
+
+| Detection | Technique | Added when |
+|---|---|---|
+| Credential attack | **T1110** Brute Force | always (the detection itself is many failed logins across accounts) |
+| PowerShell | **T1059.001** Command and Scripting Interpreter: PowerShell | always (the detection is about a PowerShell process) |
+| PowerShell | **T1027.010** Obfuscated Files or Information: Command Obfuscation | the command line uses `-EncodedCommand` |
+| PowerShell | **T1564.003** Hide Artifacts: Hidden Window | the command line uses `-WindowStyle Hidden` |
+| PowerShell | **T1105** Ingress Tool Transfer | the **same PowerShell process** connected to an external IP **and** created a file |
+| Payload | **T1105** Ingress Tool Transfer | the `curl`/`wget` URL host is external (not internal, not localhost) |
+| Payload | **T1059.004** Command and Scripting Interpreter: Unix Shell | the downloaded file was executed with a Unix shell (`bash`, `sh`, ...) as parent |
+
+Techniques considered and deliberately **not** mapped:
+
+| Technique | Why not |
+|---|---|
+| T1110.001 Password Guessing / T1110.003 Password Spraying | the telemetry does not show which passwords were tried, so the parent T1110 is used |
+| T1078 Valid Accounts | a successful login after failures is suspicious but does not prove adversary use of the account |
+| T1566.001 Spearphishing Attachment | there is no email telemetry, only a file written by Outlook |
+| T1204.002 User Execution: Malicious File | the document was opened, but nothing shows it was malicious |
+| T1222.002 Linux File and Directory Permissions Modification | `chmod +x` on a downloaded file is a normal execution prerequisite here, not evasion of access controls |
+| T1071 Application Layer Protocol / T1041 Exfiltration Over C2 Channel | connections are not shown to be command-and-control, and there is no evidence of data transfer |
+
+## Threat Intelligence
+
+Threat-intelligence enrichment looks up a detection's **external IP indicators** (the source of a credential attack, and external destinations contacted by the PowerShell or payload processes) and attaches what a provider knows about them. Internal IPs are never looked up.
+
+Threat intelligence is **context for an analyst, not proof**. A `MALICIOUS` reputation does not prove compromise, and `UNKNOWN` does not mean benign. Enrichment never changes the detection's evidence, severity or confidence.
+
+Two providers share one small interface (`name`, `simulated`, `lookup_ip(ip)`):
+
+- **`MockThreatIntelProvider` (default)**: deterministic, offline, with invented entries for the dataset's addresses. Every result has `simulated: true`, the source `Mock Threat Intelligence (simulated)` and a disclaimer, and the CLI marks each one `[SIMULATED]`. It exists so the whole project runs offline, deterministically and without credentials, for example in tests and interview demos. The simulated attacker IPs are documentation addresses, so no real intelligence about them exists.
+- **`AbuseIPDBProvider` (optional)**: queries the real [AbuseIPDB](https://www.abuseipdb.com/) v2 `check` API. AbuseIPDB was chosen because it is purpose-built for IP reputation (the only indicator type here), has one simple documented endpoint, and returns a clear 0–100 `abuseConfidenceScore`.
+
+Reputation values: `MALICIOUS`, `SUSPICIOUS`, `UNKNOWN`, `BENIGN`, and `UNAVAILABLE` (the lookup failed or was refused). For AbuseIPDB, this project treats a score ≥ 75 as `MALICIOUS` and ≥ 25 as `SUSPICIOUS`. Lower scores are `UNKNOWN`, not `BENIGN`, because "few reports" is not "safe". Whitelisted addresses are `BENIGN`. These thresholds are this project's choice, not AbuseIPDB's.
+
+## API Integration
+
+```
+Detection
+   ↓  indicators_for(): external IPs only
+Indicator (IP)
+   ↓  CachedThreatIntel: already looked up this run? → return cached result
+   ↓  not public (private, loopback, documentation range)? → refused, never sent
+Threat Intelligence API   GET https://api.abuseipdb.com/api/v2/check?ipAddress=<ip>&maxAgeInDays=90
+   ↓                      header  Key: $ABUSEIPDB_API_KEY, explicit timeout (10 s)
+JSON response             {"data": {"abuseConfidenceScore": ..., "totalReports": ..., ...}}
+   ↓  validate status → parse JSON → check required fields
+Structured enrichment     ThreatIntelResult(indicator, reputation, confidence, tags, source, simulated, details, error)
+```
+
+- **API key**: read from the `ABUSEIPDB_API_KEY` environment variable. It is never hardcoded, logged, printed, put in error messages or exported. `.env` is ignored by Git, and `.env.example` shows the variable name only.
+- **Errors**: the provider raises `ThreatIntelError` (with `MissingApiKeyError`, `AuthenticationError` and `RateLimitError` subtypes) for a missing key, HTTP 401/403, HTTP 429 (reports `Retry-After`), other non-200 statuses, timeouts, connection failures, invalid JSON and missing or invalid `abuseConfidenceScore`. Missing optional fields are recorded as `null`.
+- **Failures never break the pipeline**: `CachedThreatIntel` converts any `ThreatIntelError` into an `UNAVAILABLE` result with the reason, and detections and ATT&CK mappings are produced regardless.
+- **Offline by default**: `python main.py` uses the mock provider and makes no network requests. The real API is used only with `--threat-intel abuseipdb`. If the key is missing, the CLI says AbuseIPDB was **not** queried and does not fall back to mock data.
+- **Caching**: a small in-memory dictionary per run. Each IP reaches the provider at most once, and failures are cached too, so a rate-limited API is not called again. Nothing is persisted.
+- **Safety**: only the IP address is sent, and only to AbuseIPDB's documented API. The tool never connects to the indicator itself, downloads files, uploads telemetry or scans anything. Non-public addresses are refused before any request.
+
+Because the simulated attacker IPs are RFC 5737 documentation addresses, running the real provider against the bundled dataset reports them as *not publicly routable / not sent*. That is the correct behavior. Use `--lookup-ip` to try the real API on a real public address.
+
 ## Running Locally
 
 Requires Python 3.10+.
@@ -202,11 +273,29 @@ python main.py --no-timeline
 python main.py --inspect 0910fc527510
 python main.py --inspect DET-7240d82770
 
-# also write normalized events and detections to output/
+# also write normalized (enriched) events and detections to output/
 python main.py --export
 ```
 
-The CLI itself only uses the standard library. `pytest` is only needed for tests.
+**Offline demo** (default, mock threat intelligence, no network):
+
+```bash
+python main.py --no-timeline
+```
+
+**Optional real provider** (AbuseIPDB; makes real HTTPS requests to api.abuseipdb.com):
+
+```bash
+# PowerShell
+$env:ABUSEIPDB_API_KEY = "<your key>"
+# bash/zsh
+export ABUSEIPDB_API_KEY="<your key>"
+
+python main.py --threat-intel abuseipdb --no-timeline      # enrich the dataset's detections
+python main.py --threat-intel abuseipdb --lookup-ip <public-ip>   # look up one real public IP
+```
+
+Dependencies: `requests` (used only by the optional AbuseIPDB provider) and `pytest` (tests).
 
 ## Tests
 
@@ -216,7 +305,12 @@ python -m pytest -v
 
 - `tests/test_normalizer.py`: each event type, raw-event preservation, missing or placeholder fields, rejection of unsupported events, multiple vendor formats and the bundled dataset.
 - `tests/test_detection_engine.py`: positive **and** negative scenarios for every detection. Negative cases include failures without success, success from a different IP or outside the window, too few accounts, admin PowerShell, Word without PowerShell, activity from another host or process, download without execution, mismatched paths and wrong ordering. It also checks that shuffled input gives the same result, that IDs are deterministic, and that the bundled dataset produces exactly three detections and none on benign hosts.
-- `tests/test_command_analysis.py`: PowerShell flag parsing, safe decoding of valid and invalid `-EncodedCommand` values (including a check that decoding never runs anything), and curl/wget/chmod parsing.
+- `tests/test_command_analysis.py`: PowerShell flag parsing, safe decoding of valid and invalid `-EncodedCommand` values (including a check that decoding never runs anything), and curl/wget/chmod/URL parsing.
+- `tests/test_mitre.py`: expected techniques per detection, names that match ATT&CK, evidence-based reasons, no duplicates, and techniques that are **not** added without supporting evidence.
+- `tests/test_threat_intel.py`: mock provider behavior and labelling. AbuseIPDB success, missing key, 401/403, 429, timeout, connection failure, malformed JSON, unexpected status and missing fields, all with **faked HTTP responses**. Also: non-public IPs are never sent, the API key never appears in output, and the cache calls the provider once per IP.
+- `tests/test_enrichment.py`: enrichment of all three detections, cache use for duplicate indicators, CLI offline default, missing-key behavior and export format.
+
+`tests/conftest.py` blocks all socket connections for every test, so the suite is guaranteed to run offline.
 
 ## Disclaimer
 
@@ -225,4 +319,6 @@ python -m pytest -v
 - The normalized schema is a small internal model. It takes inspiration from concepts such as principal/target, but it **is not Google SecOps UDM** and makes no claim of UDM compatibility.
 - Detections are **behavioral heuristics over simulated data**. They can produce false positives and false negatives, and they do not replace analyst review.
 - Telemetry is treated as data: command lines are parsed, **never executed**, and no simulated IP or domain is ever contacted.
+- **Mock threat intelligence is invented** for demonstration and is labelled as simulated everywhere. It says nothing about any real address. Real threat intelligence (optional) is context, not proof.
+- ATT&CK mappings describe behavior that matches documented techniques. They do not prove intent and are not a severity rating.
 - The project runs locally, calls no external services and **does not modify any real infrastructure**.

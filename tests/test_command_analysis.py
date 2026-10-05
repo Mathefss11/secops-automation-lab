@@ -8,6 +8,7 @@ from src.command_analysis import (
     get_chmod_execute_targets,
     get_download_output_path,
     get_encoded_command,
+    get_url_hosts,
     has_hidden_window,
 )
 
@@ -136,3 +137,18 @@ def test_basename_handles_windows_and_linux_paths():
     assert basename("C:\\Program Files\\Microsoft Office\\WINWORD.EXE") == "winword.exe"
     assert basename("/usr/bin/curl") == "curl"
     assert basename(None) == ""
+
+
+@pytest.mark.parametrize(
+    "command_line, expected",
+    [
+        ("curl -fsSL http://198.51.100.77/k -o /tmp/x", ["198.51.100.77"]),
+        ("wget https://tools.example:8443/a -O /tmp/a", ["tools.example"]),
+        ("curl -s http://127.0.0.1:8080/healthz", ["127.0.0.1"]),
+        ("curl http://a.example/1 http://a.example/2", ["a.example"]),
+        ("chmod +x /tmp/x", []),
+        (None, []),
+    ],
+)
+def test_get_url_hosts(command_line, expected):
+    assert get_url_hosts(command_line) == expected
