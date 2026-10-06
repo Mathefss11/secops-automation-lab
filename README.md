@@ -9,6 +9,7 @@ It is built in phases. The current version covers:
 - **Phase 1**: simulated security telemetry, event normalization and a CLI timeline
 - **Phase 2**: a behavioral detection engine that correlates normalized events into explainable detections
 - **Phase 3**: evidence-based MITRE ATT&CK mapping and threat-intelligence enrichment (offline mock by default, optional real AbuseIPDB API)
+- **Phase 4**: an explainable incident risk engine, a SOAR-style playbook with **simulated** response actions, and JSON incident reports
 
 There is no web UI, database or cloud service. The only external API is optional and is never contacted unless explicitly requested.
 
@@ -21,7 +22,7 @@ The lab is meant to demonstrate, step by step:
 - **Detection engineering**: writing detection logic against normalized events
 - **Security automation**: enrichment, risk scoring and SOAR-style response
 
-Telemetry, normalization, behavioral detection, ATT&CK mapping and threat-intelligence enrichment exist now. Later phases will add risk scoring and simulated SOAR-style response. Neither is implemented yet.
+All of these exist now, from telemetry to simulated response. Every response action is simulated: the project never changes a firewall, endpoint, account or any other real system.
 
 ## Current Architecture
 
@@ -36,7 +37,15 @@ Detection
    ├── MITRE ATT&CK Mapping        src/mitre.py
    └── Threat Intelligence         src/threat_intel.py
             ↓
-      Enriched Detection           src/enrichment.py → CLI / JSON export (main.py)
+Enriched Detection                 src/enrichment.py
+   ↓
+Risk Engine                        src/risk_engine.py
+   ↓
+Incident                           src/incident.py
+   ↓
+SOAR-style Playbook                src/playbook.py   (simulated actions only)
+   ↓
+Incident Report                    CLI + output/incidents/INC-*.json (main.py)
 ```
 
 ## Why Normalize Security Events?
@@ -145,7 +154,7 @@ Confidence (0.0–0.95) is a **deterministic sum of documented signal weights**,
 | PowerShell | 0.00 | Office parent +0.25, encoded command +0.20, hidden window +0.10, DNS query +0.10, external connection +0.10, file created +0.05, created file executed +0.10, that file connected externally +0.05 |
 | Payload | 0.55 (download + execution of the same file) | file creation observed +0.05, execute permission added +0.20, temp/hidden path +0.05, external connection after execution +0.10 |
 
-Severity describes the detection itself. It is not an overall incident risk score; a later phase will combine detections with more context. `CRITICAL` is defined but no current detection uses it.
+Severity describes the detection itself. It is not the incident risk score, which the [Risk Engine](#risk-engine) calculates from the detection plus its context. `CRITICAL` is defined for detections but no current detection uses it.
 
 ## Event Correlation
 
@@ -249,6 +258,84 @@ Structured enrichment     ThreatIntelResult(indicator, reputation, confidence, t
 
 Because the simulated attacker IPs are RFC 5737 documentation addresses, running the real provider against the bundled dataset reports them as *not publicly routable / not sent*. That is the correct behavior. Use `--lookup-ip` to try the real API on a real public address.
 
+## Risk Engine
+
+Detection confidence and incident risk answer different questions:
+
+| | Question | Example |
+|---|---|---|
+| **Detection confidence** | *How sure are we that this behavior matches the detection?* | 0.95: almost every expected signal of a payload download-and-execute chain is present |
+| **Incident risk** | *How serious is the resulting incident, given the evidence and its context?* | 98/100: the payload ran, connected out, and the same account was just taken over by a credential attack |
+
+`src/risk_engine.py` computes a **deterministic 0–100 score** (no ML, no randomness) from four capped categories. Every point comes from a listed contributor with a reason:
+
+| Category | Max | Points |
+|---|---|---|
+| `detection_evidence` | 40 | detection confidence × 40 |
+| `observed_outcome` | 35 | the furthest attack stage the evidence shows: account access **15**, script execution **15**, or payload/file execution **25** (only the highest counts), plus **10** for an outbound external connection by the executed code |
+| `related_activity` | 15 | another detection on the **same host and same user** within 60 minutes (referenced, not merged) |
+| `threat_intel` | 10 | best reputation among the incident's indicators: MALICIOUS 10, SUSPICIOUS 5, anything else 0 |
+
+**Risk levels:** `0–39 LOW`, `40–59 MEDIUM`, `60–79 HIGH`, `80–100 CRITICAL`.
+
+**No double counting.** Launch-context signals (Office parent, encoded command, hidden window, `chmod`, temp path) already shape the detection confidence, so they are counted **only** through `detection_evidence`. Outcome facts are counted once as impact, however many signals support them, and execution stages do not stack.
+
+**Threat intelligence is context, not authority:**
+
+- It is worth at most 10 of 100 points, and several malicious indicators still count once.
+- `UNKNOWN`, `BENIGN` and failed lookups add 0 points. They never subtract, because absence of intelligence is not evidence of safety.
+- **Policy:** threat intelligence can never be the only reason an incident reaches CRITICAL. If the score without it is below 80, the level is capped at HIGH and the incident explains why.
+
+Results for the bundled dataset (score without threat intelligence in brackets):
+
+| Incident | Evidence | Outcome | Related | Threat intel | Score | Level |
+|---|---|---|---|---|---|---|
+| Possible Payload Execution on Linux Host | 38 | 25 + 10 | 15 | 10 (simulated) | **98** (88) | CRITICAL |
+| Possible Endpoint Compromise via Suspicious PowerShell | 38 | 25 + 10 | 0 | 5 (simulated) | **78** (73) | HIGH |
+| Possible Credential Compromise | 36 | 15 | 15 | 10 (simulated) | **76** (66) | HIGH |
+
+## SOAR-style Automation
+
+```
+Detection → Context (ATT&CK + threat intel) → Risk → Decision (playbook policy) → Simulated response
+```
+
+`src/playbook.py` turns each incident into deterministic actions using an explicit per-level policy:
+
+| Risk level | Actions |
+|---|---|
+| LOW | `RECORD_INCIDENT` |
+| MEDIUM | record + `ESCALATE_TO_ANALYST` |
+| HIGH | record + escalate + `RECOMMEND_*` containment (needs analyst approval) |
+| CRITICAL | record + escalate + `SIMULATE_*` containment, **only if detection confidence ≥ 0.80**, otherwise `RECOMMEND_*` |
+
+Containment is chosen per detection type and per affected entity:
+
+| Detection | Containment targets |
+|---|---|
+| Credential attack | `ACCOUNT_DISABLE` for the user (only if known), `IP_BLOCK` for the source IP (only if external) |
+| Suspicious PowerShell | `ENDPOINT_ISOLATION` for the host (only if known), `IP_BLOCK` for external destinations |
+| Payload execution | `ENDPOINT_ISOLATION` for the host (only if known), `IP_BLOCK` for external destinations |
+
+Internal IPs are never proposed for blocking. The confidence requirement for automation limits the damage a false positive could do: a high score built on a weaker detection still only produces recommendations.
+
+**All actions are simulated.** `PlaybookAction.simulated` is always `True` and cannot be set otherwise. Every action is printed as `[SIMULATED ACTION]`. The risk, incident and playbook modules import nothing that could run commands, open network connections or change the operating system, and a test checks this statically. Nothing is blocked, disabled, isolated or stopped.
+
+## Incident Reports
+
+Each detection becomes one `Incident` (`src/incident.py`). It wraps the enriched detection (composition, not a copy) and adds the risk assessment and the playbook actions. Related detections are referenced by ID but not merged.
+
+- **Incident ID:** `INC-` + the first 10 hex characters of SHA-256(detection ID), so it is deterministic and reproducible.
+- **`created_at`:** simulation time, meaning the timestamp of the incident's last evidence event. This keeps reports reproducible.
+
+`python main.py --export` writes one JSON report per incident to `output/incidents/<incident_id>.json`, in addition to `normalized_events.json` and `detections.json`. File names are the unique incident IDs, so reports never overwrite each other. Each report contains:
+
+- `risk`: score, level, `score_without_threat_intel`, an optional `level_note` and every contributor
+- `detection`: ID, name, severity, confidence, host, user, source IP, timestamps, reasoning, signals, evidence, false positives
+- `mitre_attack`, `threat_intel` (with `simulated` flags) and `related_detections`
+- `recommendations` (actions that need approval) and `playbook_actions` (all actions)
+- `simulated_response: true` and a disclaimer
+
 ## Running Locally
 
 Requires Python 3.10+.
@@ -263,17 +350,21 @@ python -m venv .venv
 
 pip install -r requirements.txt
 
-# timeline + detections
+# timeline + detections + incidents
 python main.py
 
-# detections only
+# detections + incidents, no timeline
 python main.py --no-timeline
 
-# show one normalized event or detection in full (IDs are printed in the output)
+# incident summaries only (risk, ATT&CK, threat intel, simulated playbook)
+python main.py --incidents-only
+
+# show one normalized event, detection or incident in full (IDs are printed in the output)
 python main.py --inspect 0910fc527510
 python main.py --inspect DET-7240d82770
+python main.py --inspect INC-a9f0935911
 
-# also write normalized (enriched) events and detections to output/
+# also write normalized events, detections and incident reports to output/
 python main.py --export
 ```
 
@@ -309,6 +400,9 @@ python -m pytest -v
 - `tests/test_mitre.py`: expected techniques per detection, names that match ATT&CK, evidence-based reasons, no duplicates, and techniques that are **not** added without supporting evidence.
 - `tests/test_threat_intel.py`: mock provider behavior and labelling. AbuseIPDB success, missing key, 401/403, 429, timeout, connection failure, malformed JSON, unexpected status and missing fields, all with **faked HTTP responses**. Also: non-public IPs are never sent, the API key never appears in output, and the cache calls the provider once per IP.
 - `tests/test_enrichment.py`: enrichment of all three detections, cache use for duplicate indicators, CLI offline default, missing-key behavior and export format.
+- `tests/test_risk_engine.py`: exact dataset scores, 0–100 bounds, determinism, thresholds, threat intelligence limited to context (including the CRITICAL cap), unknown or failed intelligence, confidence monotonicity, no double counting, and related-detection rules.
+- `tests/test_playbook.py`: the action policy for each level, the confidence gate for simulated automation, correct targets per detection, no account action without a user, no isolation without a host, no internal IP blocks, actions that can only be simulated, and a static check that the response modules have no system or network imports.
+- `tests/test_incident.py`: deterministic IDs and reports, composition, that all context survives (evidence, ATT&CK, threat intel, risk explanation, playbook), JSON validity, per-incident export files and the CLI.
 
 `tests/conftest.py` blocks all socket connections for every test, so the suite is guaranteed to run offline.
 
@@ -321,4 +415,6 @@ python -m pytest -v
 - Telemetry is treated as data: command lines are parsed, **never executed**, and no simulated IP or domain is ever contacted.
 - **Mock threat intelligence is invented** for demonstration and is labelled as simulated everywhere. It says nothing about any real address. Real threat intelligence (optional) is context, not proof.
 - ATT&CK mappings describe behavior that matches documented techniques. They do not prove intent and are not a severity rating.
+- Risk scores and playbook decisions are **deterministic, illustrative policies** for a lab. They are not tuned for a real environment: a real SOC would also weigh asset criticality, business impact and approval workflows.
+- **All response actions are simulated.** No firewall rule, account, endpoint, process or network interface is ever changed, and no response API exists in the code.
 - The project runs locally, calls no external services and **does not modify any real infrastructure**.
