@@ -7,7 +7,7 @@ the same host, user, process or file within a time window.
 
 Confidence is a deterministic sum of documented signal weights (no ML). It
 expresses how strongly the correlated evidence supports the detection, not the
-overall incident risk, which a later phase will calculate.
+overall incident risk, which src/risk_engine.py calculates separately.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from src.normalizer import (
 LOW = "LOW"
 MEDIUM = "MEDIUM"
 HIGH = "HIGH"
-CRITICAL = "CRITICAL"  # reserved; no Phase 2 detection is confident enough to use it
+CRITICAL = "CRITICAL"  # defined for completeness; no current detection assigns it
 
 # Correlated evidence never proves intent, so confidence is capped below 1.0.
 MAX_CONFIDENCE = 0.95

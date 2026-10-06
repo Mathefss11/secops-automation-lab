@@ -1,347 +1,231 @@
 # SecOps Automation Lab
 
-## Overview
+A local Detection Engineering and Security Automation lab written in Python. It simulates Windows and Linux security telemetry, normalizes vendor-specific events into one schema, and correlates them into behavioral detections with evidence. It then enriches each detection with MITRE ATT&CK and threat intelligence, calculates an explainable incident risk score, and runs SOAR-style playbooks whose response actions are **simulated**. It runs fully offline with no credentials.
 
-SecOps Automation Lab is a small, fully local, educational **Detection Engineering / Security Automation** lab written in Python.
+Separately, [`detections/`](detections/) contains **YARA-L 2.0** versions of the three detections, written against Google SecOps UDM from official documentation. They are learning and portfolio material. They have not been deployed or validated in a Google SecOps tenant (see [Google SecOps / YARA-L](#google-secops--yara-l)).
 
-It is built in phases. The current version covers:
+**What it does**
 
-- **Phase 1**: simulated security telemetry, event normalization and a CLI timeline
-- **Phase 2**: a behavioral detection engine that correlates normalized events into explainable detections
-- **Phase 3**: evidence-based MITRE ATT&CK mapping and threat-intelligence enrichment (offline mock by default, optional real AbuseIPDB API)
-- **Phase 4**: an explainable incident risk engine, a SOAR-style playbook with **simulated** response actions, and JSON incident reports
-- **Phase 5**: Google SecOps learning material: YARA-L 2.0 equivalents of the three detections and a UDM / YARA-L mapping document (written from official documentation, **not validated in a live tenant**)
+- **Telemetry:** 45 simulated events from 5 log formats (OpenSSH, a Linux endpoint sensor, a firewall, Windows Security, Sysmon), covering two attack scenarios mixed with benign activity
+- **Normalization:** vendor fields are mapped into one `NormalizedEvent` schema, with principal/target roles and the raw event preserved
+- **Detection:** three multi-event behavioral detections, with deterministic evidence IDs, explainable confidence and documented false positives
+- **Enrichment:** ATT&CK techniques that are only mapped when the evidence supports them, plus threat intelligence (offline mock by default, optional AbuseIPDB API)
+- **Response:** a 0–100 incident risk score with listed contributors, a simulated SOAR playbook, and JSON incident reports
+- **Google SecOps:** YARA-L 2.0 versions of the detections and a UDM mapping guide
+- **Tests:** 286 pytest tests that run offline, including negative and false-positive cases
 
-There is no web UI, database or cloud service. The only external API is optional and is never contacted unless explicitly requested.
+## Why This Project Exists
 
-## Goals
+An individual event is rarely a conclusion. A failed login, a PowerShell process, a `curl` command or an outbound connection are all normal on their own. Detection engineering is about deciding **when a sequence of events justifies a conclusion**, how confident that conclusion is, and what to do about it.
 
-The lab is meant to demonstrate, step by step:
+The lab works through that chain end to end, at a size where every decision can be read and explained:
 
-- **Security telemetry**: realistic Linux, Windows and network events, both benign and suspicious
-- **Normalization**: mapping vendor-specific logs onto one common schema
-- **Detection engineering**: writing detection logic against normalized events
-- **Security automation**: enrichment, risk scoring and SOAR-style response
+- **Telemetry and normalization:** different products describe the same activity differently, so events are normalized before any detection logic runs.
+- **Events vs conclusions:** detections fire on correlated behavior (same host, user, process instance or file), never on a tool name alone.
+- **False-positive awareness:** every detection documents benign explanations, and the dataset contains benign look-alikes that must not trigger.
+- **Context vs evidence:** ATT&CK and threat intelligence add context. They never change the evidence, and threat intelligence alone cannot make an incident critical.
+- **Explainability:** confidence, risk and playbook decisions are deterministic, with a reason attached to every point and action.
+- **Safe automation:** response logic is fully simulated and separates recommendations from automated actions.
 
-All of these exist now, from telemetry to simulated response. Every response action is simulated: the project never changes a firewall, endpoint, account or any other real system.
+## Architecture
 
-## Current Architecture
+```mermaid
+flowchart TD
+    subgraph LOCAL["Local Python pipeline (executable)"]
+        T["Simulated security telemetry<br/>data/security_events.json"] --> N["Normalization<br/>normalizer.py → NormalizedEvent"]
+        N --> D["Detection engine<br/>detection_engine.py"]
+        D --> DE["Detection + evidence"]
+        DE --> M["MITRE ATT#amp;CK mapping<br/>mitre.py"]
+        DE --> TI["Threat intelligence<br/>threat_intel.py (mock by default)"]
+        M --> ED["Enriched detection<br/>enrichment.py"]
+        TI --> ED
+        ED --> R["Risk engine<br/>risk_engine.py"]
+        R --> I["Incident<br/>incident.py"]
+        I --> P["SOAR-style playbook<br/>playbook.py"]
+        P --> S["Simulated response<br/>no real system is changed"]
+        S --> REP["Incident report<br/>CLI + output/incidents/*.json"]
+    end
 
-```
-Telemetry                          data/security_events.json
-   ↓
-Normalization                      src/normalizer.py
-   ↓
-Detection Engine                   src/detection_engine.py, src/command_analysis.py
-   ↓
-Detection
-   ├── MITRE ATT&CK Mapping        src/mitre.py
-   └── Threat Intelligence         src/threat_intel.py
-            ↓
-Enriched Detection                 src/enrichment.py
-   ↓
-Risk Engine                        src/risk_engine.py
-   ↓
-Incident                           src/incident.py
-   ↓
-SOAR-style Playbook                src/playbook.py   (simulated actions only)
-   ↓
-Incident Report                    CLI + output/incidents/INC-*.json (main.py)
-```
+    subgraph GSO["Google SecOps (conceptual mapping, not executed here)"]
+        G1["Vendor logs"] --> G2["Parser"] --> G3["UDM events"] --> G4["YARA-L 2.0 rules<br/>detections/*.yaral"]
+    end
 
-Alongside the executable Python pipeline, `detections/*.yaral` contains YARA-L 2.0 portfolio equivalents of the three detections for Google SecOps. See [Google SecOps / YARA-L](#google-secops--yara-l).
-
-## Why Normalize Security Events?
-
-Each security product logs the same idea differently. A source IP shows up as `src_ip` in a parsed sshd log, `source_address` in a firewall log and `SourceIp` in Sysmon. Timestamps can be ISO 8601 strings, epoch milliseconds or naive UTC strings. Windows writes `-` when a field has no value.
-
-Without normalization, every detection and every investigation query has to be written once per vendor. With it, logic like "a process on any host connected to this IP" can be written once against `destination_ip`.
-
-The normalizer also keeps the **original raw event** on every normalized event, so analysts can still see vendor-specific details (for example the full sshd log message) that the common schema does not include.
-
-### Supported log sources
-
-| `log_source`       | Represents                             | Time format                   | Example vendor fields                  |
-|--------------------|----------------------------------------|-------------------------------|----------------------------------------|
-| `linux_sshd`       | OpenSSH auth logs (syslog, pre-parsed) | ISO 8601 with offset          | `user`, `src_ip`, `host`               |
-| `linux_edr`        | Simulated Linux endpoint sensor        | Epoch milliseconds            | `username`, `exe_path`, `cmdline`      |
-| `network_firewall` | Simulated perimeter firewall           | `YYYY-MM-DD HH:MM:SS` (UTC)   | `source_address`, `destination_address`|
-| `windows_security` | Windows Security log 4624 / 4625       | ISO 8601 `Z`                  | `TargetUserName`, `IpAddress`          |
-| `sysmon`           | Sysmon Event IDs 1, 3, 11, 22          | `YYYY-MM-DD HH:MM:SS.fff` UTC | `Image`, `CommandLine`, `QueryName`    |
-
-Each raw event has a `log_source` label, similar to the ingestion label a SIEM uses to pick a parser.
-
-### Normalized schema
-
-| Field                                  | Notes                                                                 |
-|----------------------------------------|-----------------------------------------------------------------------|
-| `event_id`                             | Deterministic ID (truncated SHA-256 of the raw event)                 |
-| `timestamp`                            | ISO 8601, UTC, millisecond precision, e.g. `2026-09-14T09:41:03.000Z` |
-| `event_type`                           | One of the event types below                                          |
-| `vendor`, `log_source`                 | Where the event came from                                             |
-| `principal`, `target`                  | Initiating entity and acted-upon entity (see below)                   |
-| `user`                                 | Account name, domain prefix removed (`CORP\mgarcia` → `mgarcia`)      |
-| `host`                                 | Short hostname (`FIN-WS-07.corp.example.com` → `FIN-WS-07`)           |
-| `process`, `parent_process`            | Executable paths                                                      |
-| `process_id`, `parent_process_id`      | PIDs, used to tie activity to one process instance                    |
-| `command_line`                         | Full command line, if available                                       |
-| `source_ip`, `destination_ip`          |                                                                       |
-| `destination_port`                     | Always an integer                                                     |
-| `dns_query`                            | Queried domain name                                                   |
-| `file_path`                            | File created or modified                                              |
-| `result`                               | `SUCCESS` / `FAILURE` (authentication), `ALLOWED` / `BLOCKED` (firewall) |
-| `raw_event`                            | Unmodified copy of the original event                                 |
-
-Fields that an event does not provide are `null`. Empty strings and `-` placeholders become `null` too.
-
-**Event types:** `AUTHENTICATION`, `PROCESS_CREATE`, `NETWORK_CONNECTION`, `DNS_QUERY`, `FILE_CREATE`, `FILE_MODIFICATION`
-
-**Principal and target.** The principal is the entity that started the action and the target is the entity it acted on. Which fields go where depends on the event type:
-
-| Event type           | Principal                           | Target                      |
-|----------------------|-------------------------------------|-----------------------------|
-| `AUTHENTICATION`     | source IP                           | user account, host          |
-| `PROCESS_CREATE`     | user, host, **parent** process      | new process, command line   |
-| `NETWORK_CONNECTION` | user, host, process, source IP      | destination IP and port     |
-| `DNS_QUERY`          | user, host, process                 | queried hostname            |
-| `FILE_CREATE` / `FILE_MODIFICATION` | user, host, process  | file path                   |
-
-The flat fields (`user`, `source_ip`, ...) are kept for simple querying. `principal` and `target` are built from them and make each entity's role explicit.
-
-## Simulated Scenarios
-
-The dataset (`data/security_events.json`, 45 events) covers one simulated day across three hosts:
-
-- **Linux server (`web-prod-01`)**: A burst of failed SSH logins from one external IP against several usernames, followed by a successful login and shell activity on that host. The data does **not** show whether the same password was tried against each account, so it is not labelled "password spraying".
-- **Windows workstation (`FIN-WS-07`)**: An Office document received by email, followed by PowerShell activity and further process and network events that are worth investigating.
-- **Benign noise**: Normal SSH admin sessions, `systemctl`, `git pull`, a local `curl` health check, `apt-get update`, a mistyped Windows password followed by a successful login, browsing to GitHub, Outlook traffic, routine PowerShell (`Get-Service`) and Windows Update scans.
-
-No single event here proves malicious activity. A failed login, a PowerShell process or a `curl` command means nothing on its own. Telling suspicious activity apart from noise takes context and correlation, which is what the detection engine does.
-
-All IPs and domains for the external actor come from documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, RFC 5737) and the reserved `.example` TLD (RFC 2606).
-
-## Detection Engine
-
-`src/detection_engine.py` runs three behavioral detections over the normalized events. Each one looks for a **sequence** of related events. None of them fires on a single event or on a tool name alone.
-
-| Detection | Fires when | Severity |
-|---|---|---|
-| **Credential Attack Followed by Successful Authentication** | ≥ 5 failed logins against ≥ 3 distinct accounts from **one source IP** to **one host**, followed within 5 minutes by a successful login from that same IP to that same host | HIGH |
-| **Suspicious PowerShell Execution** | PowerShell starts with suspicious launch context (Office parent, `-EncodedCommand`, hidden window), **and** the confidence from that context plus the follow-on activity of *that same process* reaches 0.35 | MEDIUM, or HIGH at confidence ≥ 0.70 |
-| **Payload Download and Execution** | `curl`/`wget` writes a file to an absolute path, and that **same file** is later executed on the same host by the same user within 15 minutes | HIGH if `chmod` added execute permission between download and execution, otherwise MEDIUM |
-
-Some deliberate choices:
-
-- The credential detection is **not** called password spraying. The telemetry does not show whether the same password was tried against each account.
-- A download alone never produces a payload detection. **Execution telemetry is required.** The evidence labels the `DOWNLOAD`, `PERMISSION`, `EXECUTION` and `NETWORK` steps separately.
-- External connections are reported as external connections. They are never labelled command-and-control or exfiltration, because the telemetry does not show that.
-- `src/command_analysis.py` parses command lines as **untrusted strings**. It handles PowerShell flags (including abbreviations such as `-e`, `-enc` and `-W Hidden`), `curl -o` / `wget -O` output paths and `chmod` modes. It can also decode `-EncodedCommand` values (Base64 of UTF-16LE) so analysts can read them. Decoded text is **only displayed, never executed**, and invalid input returns `None`.
-
-Thresholds and windows live in one place, `DetectionConfig`:
-
-```python
-DetectionConfig(
-    auth_window=timedelta(minutes=5), auth_min_failures=5, auth_min_distinct_accounts=3,
-    powershell_window=timedelta(minutes=5), powershell_min_confidence=0.35,
-    payload_window=timedelta(minutes=15),
-)
+    N -.->|analogous to| G3
+    D -.->|same logic expressed as| G4
 ```
 
-### Confidence
+The dotted links are analogies. The YARA-L rules are not run by the Python pipeline, and the local schema is not UDM.
 
-Confidence (0.0–0.95) is a **deterministic sum of documented signal weights**, not machine learning. Every detection lists the signals that contributed and their weights, so the number can always be explained. It is capped at 0.95 because correlated telemetry still does not prove intent.
+## Detections
 
-| Detection | Base | Additional signals |
-|---|---|---|
-| Credential attack | 0.70 (thresholds met + success) | external source IP +0.10, an account that failed later succeeded +0.10 |
-| PowerShell | 0.00 | Office parent +0.25, encoded command +0.20, hidden window +0.10, DNS query +0.10, external connection +0.10, file created +0.05, created file executed +0.10, that file connected externally +0.05 |
-| Payload | 0.55 (download + execution of the same file) | file creation observed +0.05, execute permission added +0.20, temp/hidden path +0.05, external connection after execution +0.10 |
+| Detection | Behavior | Correlation | MITRE ATT&CK | Typical false positives |
+|---|---|---|---|---|
+| **Credential Attack Followed by Successful Authentication** | ≥ 5 failed logins against ≥ 3 accounts, then a successful login | same source IP and target host, 5-minute window | T1110 Brute Force (parent technique only; password reuse is not observable, so it is **not** labelled password spraying) | mistyped passwords, services with stale credentials, authorized scanners, shared NAT/VPN IPs |
+| **Suspicious PowerShell Execution** | PowerShell with suspicious launch context (Office parent, `-EncodedCommand`, hidden window), plus follow-on DNS, external connection, file creation and execution by that process | host + PID + image + 5-minute window | T1059.001; T1027.010, T1564.003 and T1105 when that specific evidence is present | admin automation, deployment and management tools, approved Office macros |
+| **Payload Download and Execution** | `curl`/`wget` writes a file, `chmod` adds execute permission, the **same file** runs, and optionally connects out | host + user + exact file path, ordered, 15-minute window | T1105 (external download source), T1059.004 (executed from a Unix shell) | install scripts, CI/DevOps automation, legitimate temporary installers |
 
-Severity describes the detection itself. It is not the incident risk score, which the [Risk Engine](#risk-engine) calculates from the detection plus its context. `CRITICAL` is defined for detections but no current detection uses it.
+Execution evidence is required: a download alone never produces a payload detection. Detection logic, confidence weights and correlation keys are documented in [docs/design.md](docs/design.md).
 
-## Event Correlation
+## Pipeline Walkthrough: One Incident
 
-Individual events rarely carry enough context. Compare:
+The Linux scenario exercises the whole pipeline. The excerpts below are real output of `python main.py`, re-wrapped and shortened in places.
 
-- `curl ... -o /tmp/.cache-update` on its own is how many install scripts start.
-- The same `curl` command, then `chmod +x` on **that path**, then execution of **that path** by the **same user on the same host**, then an outbound connection **from that process**, is a pattern worth investigating.
+**1. Telemetry.** Six failed SSH logins against six accounts from `203.0.113.45` are followed by a successful login as `deploy` on `web-prod-01`. That alone becomes a separate credential-attack detection. A shell session follows, and then:
 
-The detectors correlate on explicit keys:
+```
+- b6c1a716c90a  09:43:10.000  DOWNLOAD: curl wrote /tmp/.cache-update
+- 51cce5b1ce67  09:43:11.000  file created: /tmp/.cache-update
+- a8cce6c1e741  09:43:19.000  PERMISSION: chmod +x /tmp/.cache-update
+- 87939fa6b08d  09:43:19.500  PERMISSION: mode of /tmp/.cache-update changed by chmod
+- cc5d2ecdd2ac  09:43:24.000  EXECUTION: /tmp/.cache-update started
+- 447edf4c110f  09:43:26.000  NETWORK: .cache-update connected to 198.51.100.77:8443
+```
 
-- **Credential attack**: source IP + target host + time window.
-- **PowerShell**: host + process ID + process image + time window. Operating systems reuse PIDs, so a PID is never trusted on its own. A file counts as "executed" only when a child of that PowerShell process runs the exact path PowerShell created.
-- **Payload**: host + user + exact file path + ordering (download → chmod → execution → network).
+Each line is a normalized event, referenced by its deterministic `event_id`.
 
-Correlation uses parsed, timezone-aware UTC timestamps. Events are sorted before correlation, so input order does not matter. Activity from another host, another process or outside the window is not counted.
+**2. Behavioral detection.** The detection only exists because these events share a host, a user and an exact file path, in the right order:
 
-## Detection Evidence
+```
+[HIGH] Payload Download and Execution        Confidence: 0.95
+  On web-prod-01, user 'deploy' downloaded /tmp/.cache-update with curl, made it
+  executable, and executed it 14 seconds after the download. The executed file then
+  connected to 198.51.100.77:8443. Each step is common on its own; the sequence on one
+  file is consistent with a downloaded payload being run and requires investigation.
+  The destinations are not confirmed as malicious.
+```
 
-Each normalized event has a deterministic `event_id` (a truncated SHA-256 of the raw event). Detections reference evidence by these IDs and do not copy whole events. Each evidence entry includes a short description of why it matters. A detection's own `detection_id` comes from its name and evidence IDs, so the same data always produces the same detection IDs.
+The external connection is reported as an external connection. It is **not** labelled command-and-control or exfiltration, because the telemetry does not show that.
 
-An analyst can pivot from a detection to the full normalized event and its preserved raw event:
+**3. Enrichment, risk and the simulated playbook.** The resulting incident (from `python main.py --incidents-only`, slightly abridged):
+
+```
+[CRITICAL] Possible Payload Execution on Linux Host
+    Incident ID:          INC-a9f0935911
+    Detection:            Payload Download and Execution (DET-7240d82770)
+    Host:                 web-prod-01
+    User:                 deploy
+    Detection confidence: 0.95
+    Risk score:           98/100 (CRITICAL)
+
+  Risk contributors:
+    +38   detection_evidence: detection confidence 0.95 x 40 (6 correlated evidence events)
+    +25   observed_outcome: downloaded file /tmp/.cache-update was executed
+    +10   observed_outcome: outbound connection to external IP(s) by the executed code: 198.51.100.77
+    +15   related_activity: related detection on web-prod-01 for user 'deploy' within 60 minutes:
+          Credential Attack Followed by Successful Authentication (DET-61c034a14d)
+    +10   threat_intel: 198.51.100.77 has MALICIOUS reputation (simulated intelligence, context only)
+
+  MITRE ATT&CK:
+    T1105 Ingress Tool Transfer, T1059.004 Command and Scripting Interpreter: Unix Shell
+
+  Threat Intelligence:
+    198.51.100.77: MALICIOUS - Mock Threat Intelligence (simulated)
+
+  Playbook (simulated - no real system is changed):
+    [SIMULATED ACTION] RECORD_INCIDENT: Record incident INC-a9f0935911
+    [SIMULATED ACTION] ESCALATE_TO_ANALYST: Escalate INC-a9f0935911 to an analyst
+    [SIMULATED ACTION] SIMULATE_ENDPOINT_ISOLATION: Isolate host web-prod-01
+    [SIMULATED ACTION] SIMULATE_IP_BLOCK: Block IP 198.51.100.77
+```
+
+The threat-intelligence reputation is invented mock data. Without it the score is still 88, so it is not what makes the incident CRITICAL. The other two incidents (the PowerShell chain and the credential attack) score 78 and 76 (HIGH) and only receive *recommended* containment, which needs analyst approval.
+
+## Quick Start
+
+Requires Python 3 (developed and tested with Python 3.14; no newer-than-3.10 syntax is used, but older versions were not tested).
+
+**Windows (PowerShell)**
+
+```powershell
+git clone https://github.com/Mathefss11/secops-automation-lab.git
+cd secops-automation-lab
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+python -m pytest -v                  # run the test suite
+python main.py --no-timeline         # offline demo: detections + incidents
+python main.py --export              # write JSON reports to output/
+```
+
+If PowerShell blocks `Activate.ps1`, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that window first. This affects the current session only.
+
+**Linux / macOS**
 
 ```bash
-python main.py --inspect <event_id>       # normalized event + raw_event
-python main.py --inspect <DET-id>         # full detection as JSON
+git clone https://github.com/Mathefss11/secops-automation-lab.git
+cd secops-automation-lab
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python -m pytest -v
+python main.py --no-timeline
+python main.py --export
 ```
 
-## False Positives
+Dependencies are `requests` (used only by the optional AbuseIPDB provider) and `pytest`.
 
-Correlation reduces false positives. It does not eliminate them. Every detection lists likely benign explanations in its output:
+## Demo Commands
 
-- **Credential attack**: users mistyping passwords, services retrying stale credentials, authorized vulnerability scanners, shared NAT/VPN egress addresses.
-- **PowerShell**: administrative automation, software deployment and management tools (some legitimately use `-EncodedCommand` and hidden windows), approved Office add-ins or macros.
-- **Payload**: install scripts (`curl -o /tmp/install.sh && chmod +x ...`), DevOps/CI automation, legitimate temporary installers.
-
-The bundled dataset includes benign versions of these behaviors: a mistyped Windows password, admin PowerShell, a local `curl` health check, `apt-get update` and `git pull`. The tests check that none of them trigger a detection.
-
-## MITRE ATT&CK Mapping
-
-[MITRE ATT&CK](https://attack.mitre.org/) is a public knowledge base of adversary behaviors, organized as tactics (the goal) and techniques (how the goal is reached). Mapping a detection to techniques gives analysts a shared vocabulary, links to documented procedures and mitigations, and a way to see which behaviors detection logic covers.
-
-A mapping means "the observed activity matches this documented behavior". It does **not** prove malicious intent, and ATT&CK is **not** a severity scale. Mapping never changes a detection's severity or confidence.
-
-`src/mitre.py` adds a technique **only when specific evidence in the detection supports it**, and each mapping's `reason` cites that evidence. Technique IDs and names were checked against attack.mitre.org on 2026-10-05.
-
-| Detection | Technique | Added when |
-|---|---|---|
-| Credential attack | **T1110** Brute Force | always (the detection itself is many failed logins across accounts) |
-| PowerShell | **T1059.001** Command and Scripting Interpreter: PowerShell | always (the detection is about a PowerShell process) |
-| PowerShell | **T1027.010** Obfuscated Files or Information: Command Obfuscation | the command line uses `-EncodedCommand` |
-| PowerShell | **T1564.003** Hide Artifacts: Hidden Window | the command line uses `-WindowStyle Hidden` |
-| PowerShell | **T1105** Ingress Tool Transfer | the **same PowerShell process** connected to an external IP **and** created a file |
-| Payload | **T1105** Ingress Tool Transfer | the `curl`/`wget` URL host is external (not internal, not localhost) |
-| Payload | **T1059.004** Command and Scripting Interpreter: Unix Shell | the downloaded file was executed with a Unix shell (`bash`, `sh`, ...) as parent |
-
-Techniques considered and deliberately **not** mapped:
-
-| Technique | Why not |
+| Command | What it shows |
 |---|---|
-| T1110.001 Password Guessing / T1110.003 Password Spraying | the telemetry does not show which passwords were tried, so the parent T1110 is used |
-| T1078 Valid Accounts | a successful login after failures is suspicious but does not prove adversary use of the account |
-| T1566.001 Spearphishing Attachment | there is no email telemetry, only a file written by Outlook |
-| T1204.002 User Execution: Malicious File | the document was opened, but nothing shows it was malicious |
-| T1222.002 Linux File and Directory Permissions Modification | `chmod +x` on a downloaded file is a normal execution prerequisite here, not evasion of access controls |
-| T1071 Application Layer Protocol / T1041 Exfiltration Over C2 Channel | connections are not shown to be command-and-control, and there is no evidence of data transfer |
+| `python main.py` | full run: event timeline, detections with evidence, incidents |
+| `python main.py --no-timeline` | detections and incidents without the 45-event timeline |
+| `python main.py --incidents-only` | compact incident summaries: risk, ATT&CK, threat intel, playbook |
+| `python main.py --export` | also writes `output/normalized_events.json`, `output/detections.json` and `output/incidents/INC-*.json` |
+| `python main.py --inspect <ID>` | one record as JSON: an event ID (e.g. `0910fc527510`), a detection (`DET-7240d82770`) or an incident (`INC-a9f0935911`) |
+| `python main.py --threat-intel mock` | the default, stated explicitly: offline mock threat intelligence |
 
-## Threat Intelligence
+Threat intelligence uses the **offline mock provider by default**. The real AbuseIPDB API is only contacted when you ask for it explicitly:
 
-Threat-intelligence enrichment looks up a detection's **external IP indicators** (the source of a credential attack, and external destinations contacted by the PowerShell or payload processes) and attaches what a provider knows about them. Internal IPs are never looked up.
-
-Threat intelligence is **context for an analyst, not proof**. A `MALICIOUS` reputation does not prove compromise, and `UNKNOWN` does not mean benign. Enrichment never changes the detection's evidence, severity or confidence.
-
-Two providers share one small interface (`name`, `simulated`, `lookup_ip(ip)`):
-
-- **`MockThreatIntelProvider` (default)**: deterministic, offline, with invented entries for the dataset's addresses. Every result has `simulated: true`, the source `Mock Threat Intelligence (simulated)` and a disclaimer, and the CLI marks each one `[SIMULATED]`. It exists so the whole project runs offline, deterministically and without credentials, for example in tests and interview demos. The simulated attacker IPs are documentation addresses, so no real intelligence about them exists.
-- **`AbuseIPDBProvider` (optional)**: queries the real [AbuseIPDB](https://www.abuseipdb.com/) v2 `check` API. AbuseIPDB was chosen because it is purpose-built for IP reputation (the only indicator type here), has one simple documented endpoint, and returns a clear 0–100 `abuseConfidenceScore`.
-
-Reputation values: `MALICIOUS`, `SUSPICIOUS`, `UNKNOWN`, `BENIGN`, and `UNAVAILABLE` (the lookup failed or was refused). For AbuseIPDB, this project treats a score ≥ 75 as `MALICIOUS` and ≥ 25 as `SUSPICIOUS`. Lower scores are `UNKNOWN`, not `BENIGN`, because "few reports" is not "safe". Whitelisted addresses are `BENIGN`. These thresholds are this project's choice, not AbuseIPDB's.
-
-## API Integration
-
-```
-Detection
-   ↓  indicators_for(): external IPs only
-Indicator (IP)
-   ↓  CachedThreatIntel: already looked up this run? → return cached result
-   ↓  not public (private, loopback, documentation range)? → refused, never sent
-Threat Intelligence API   GET https://api.abuseipdb.com/api/v2/check?ipAddress=<ip>&maxAgeInDays=90
-   ↓                      header  Key: $ABUSEIPDB_API_KEY, explicit timeout (10 s)
-JSON response             {"data": {"abuseConfidenceScore": ..., "totalReports": ..., ...}}
-   ↓  validate status → parse JSON → check required fields
-Structured enrichment     ThreatIntelResult(indicator, reputation, confidence, tags, source, simulated, details, error)
+```powershell
+$env:ABUSEIPDB_API_KEY = "<your-key>"                       # bash: export ABUSEIPDB_API_KEY="<your-key>"
+python main.py --threat-intel abuseipdb --no-timeline
+python main.py --threat-intel abuseipdb --lookup-ip <public-ip>
 ```
 
-- **API key**: read from the `ABUSEIPDB_API_KEY` environment variable. It is never hardcoded, logged, printed, put in error messages or exported. `.env` is ignored by Git, and `.env.example` shows the variable name only.
-- **Errors**: the provider raises `ThreatIntelError` (with `MissingApiKeyError`, `AuthenticationError` and `RateLimitError` subtypes) for a missing key, HTTP 401/403, HTTP 429 (reports `Retry-After`), other non-200 statuses, timeouts, connection failures, invalid JSON and missing or invalid `abuseConfidenceScore`. Missing optional fields are recorded as `null`.
-- **Failures never break the pipeline**: `CachedThreatIntel` converts any `ThreatIntelError` into an `UNAVAILABLE` result with the reason, and detections and ATT&CK mappings are produced regardless.
-- **Offline by default**: `python main.py` uses the mock provider and makes no network requests. The real API is used only with `--threat-intel abuseipdb`. If the key is missing, the CLI says AbuseIPDB was **not** queried and does not fall back to mock data.
-- **Caching**: a small in-memory dictionary per run. Each IP reaches the provider at most once, and failures are cached too, so a rate-limited API is not called again. Nothing is persisted.
-- **Safety**: only the IP address is sent, and only to AbuseIPDB's documented API. The tool never connects to the indicator itself, downloads files, uploads telemetry or scans anything. Non-public addresses are refused before any request.
+The dataset's attacker IPs are documentation addresses, so the real provider reports them as *not publicly routable, not sent*. Use `--lookup-ip` to query a real public IP. If the key is not set, the CLI says AbuseIPDB was not queried, and the detections still run.
 
-Because the simulated attacker IPs are RFC 5737 documentation addresses, running the real provider against the bundled dataset reports them as *not publicly routable / not sent*. That is the correct behavior. Use `--lookup-ip` to try the real API on a real public address.
-
-## Risk Engine
-
-Detection confidence and incident risk answer different questions:
-
-| | Question | Example |
-|---|---|---|
-| **Detection confidence** | *How sure are we that this behavior matches the detection?* | 0.95: almost every expected signal of a payload download-and-execute chain is present |
-| **Incident risk** | *How serious is the resulting incident, given the evidence and its context?* | 98/100: the payload ran, connected out, and the same account was just taken over by a credential attack |
-
-`src/risk_engine.py` computes a **deterministic 0–100 score** (no ML, no randomness) from four capped categories. Every point comes from a listed contributor with a reason:
-
-| Category | Max | Points |
-|---|---|---|
-| `detection_evidence` | 40 | detection confidence × 40 |
-| `observed_outcome` | 35 | the furthest attack stage the evidence shows: account access **15**, script execution **15**, or payload/file execution **25** (only the highest counts), plus **10** for an outbound external connection by the executed code |
-| `related_activity` | 15 | another detection on the **same host and same user** within 60 minutes (referenced, not merged) |
-| `threat_intel` | 10 | best reputation among the incident's indicators: MALICIOUS 10, SUSPICIOUS 5, anything else 0 |
-
-**Risk levels:** `0–39 LOW`, `40–59 MEDIUM`, `60–79 HIGH`, `80–100 CRITICAL`.
-
-**No double counting.** Launch-context signals (Office parent, encoded command, hidden window, `chmod`, temp path) already shape the detection confidence, so they are counted **only** through `detection_evidence`. Outcome facts are counted once as impact, however many signals support them, and execution stages do not stack.
-
-**Threat intelligence is context, not authority:**
-
-- It is worth at most 10 of 100 points, and several malicious indicators still count once.
-- `UNKNOWN`, `BENIGN` and failed lookups add 0 points. They never subtract, because absence of intelligence is not evidence of safety.
-- **Policy:** threat intelligence can never be the only reason an incident reaches CRITICAL. If the score without it is below 80, the level is capped at HIGH and the incident explains why.
-
-Results for the bundled dataset (score without threat intelligence in brackets):
-
-| Incident | Evidence | Outcome | Related | Threat intel | Score | Level |
-|---|---|---|---|---|---|---|
-| Possible Payload Execution on Linux Host | 38 | 25 + 10 | 15 | 10 (simulated) | **98** (88) | CRITICAL |
-| Possible Endpoint Compromise via Suspicious PowerShell | 38 | 25 + 10 | 0 | 5 (simulated) | **78** (73) | HIGH |
-| Possible Credential Compromise | 36 | 15 | 15 | 10 (simulated) | **76** (66) | HIGH |
-
-## SOAR-style Automation
+## Project Structure
 
 ```
-Detection → Context (ATT&CK + threat intel) → Risk → Decision (playbook policy) → Simulated response
+secops-automation-lab/
+├── data/security_events.json     simulated raw telemetry (5 vendor formats, 45 events)
+├── src/
+│   ├── normalizer.py             vendor parsers → NormalizedEvent (raw event preserved)
+│   ├── command_analysis.py       parses PowerShell / curl / wget / chmod command lines (never executes)
+│   ├── detection_engine.py       the three behavioral detections, evidence, confidence
+│   ├── mitre.py                  evidence-conditional ATT&CK mapping
+│   ├── threat_intel.py           mock + optional AbuseIPDB provider, error handling, cache
+│   ├── enrichment.py             Detection + ATT&CK + threat intel → EnrichedDetection
+│   ├── risk_engine.py            explainable 0–100 incident risk
+│   ├── incident.py               Incident model and JSON report
+│   └── playbook.py               SOAR-style policy → simulated actions
+├── detections/*.yaral            YARA-L 2.0 versions of the detections (not tenant-validated)
+├── docs/
+│   ├── design.md                 detailed design reference
+│   ├── google-secops.md          UDM / YARA-L mapping, rule walkthroughs, official references
+│   └── interview-guide.md        technical review notes and demo flow
+├── tests/                        pytest suite (offline; sockets blocked in conftest.py)
+├── output/                       generated reports (git-ignored)
+├── main.py                       CLI
+└── requirements.txt
 ```
 
-`src/playbook.py` turns each incident into deterministic actions using an explicit per-level policy:
+## Local Normalization vs UDM
 
-| Risk level | Actions |
-|---|---|
-| LOW | `RECORD_INCIDENT` |
-| MEDIUM | record + `ESCALATE_TO_ANALYST` |
-| HIGH | record + escalate + `RECOMMEND_*` containment (needs analyst approval) |
-| CRITICAL | record + escalate + `SIMULATE_*` containment, **only if detection confidence ≥ 0.80**, otherwise `RECOMMEND_*` |
+```
+Local:          vendor-style simulated logs → normalizer.py → NormalizedEvent → Python detections
+Google SecOps:  vendor logs                 → parser        → UDM             → YARA-L rules
+```
 
-Containment is chosen per detection type and per affected entity:
-
-| Detection | Containment targets |
-|---|---|
-| Credential attack | `ACCOUNT_DISABLE` for the user (only if known), `IP_BLOCK` for the source IP (only if external) |
-| Suspicious PowerShell | `ENDPOINT_ISOLATION` for the host (only if known), `IP_BLOCK` for external destinations |
-| Payload execution | `ENDPOINT_ISOLATION` for the host (only if known), `IP_BLOCK` for external destinations |
-
-Internal IPs are never proposed for blocking. The confidence requirement for automation limits the damage a false positive could do: a high score built on a weaker detection still only produces recommendations.
-
-**All actions are simulated.** `PlaybookAction.simulated` is always `True` and cannot be set otherwise. Every action is printed as `[SIMULATED ACTION]`. The risk, incident and playbook modules import nothing that could run commands, open network connections or change the operating system, and a test checks this statically. Nothing is blocked, disabled, isolated or stopped.
-
-## Incident Reports
-
-Each detection becomes one `Incident` (`src/incident.py`). It wraps the enriched detection (composition, not a copy) and adds the risk assessment and the playbook actions. Related detections are referenced by ID but not merged.
-
-- **Incident ID:** `INC-` + the first 10 hex characters of SHA-256(detection ID), so it is deterministic and reproducible.
-- **`created_at`:** simulation time, meaning the timestamp of the incident's last evidence event. This keeps reports reproducible.
-
-`python main.py --export` writes one JSON report per incident to `output/incidents/<incident_id>.json`, in addition to `normalized_events.json` and `detections.json`. File names are the unique incident IDs, so reports never overwrite each other. Each report contains:
-
-- `risk`: score, level, `score_without_threat_intel`, an optional `level_note` and every contributor
-- `detection`: ID, name, severity, confidence, host, user, source IP, timestamps, reasoning, signals, evidence, false positives
-- `mitre_attack`, `threat_intel` (with `simulated` flags) and `related_detections`
-- `recommendations` (actions that need approval) and `playbook_actions` (all actions)
-- `simulated_response: true` and a disclaimer
+Both designs normalize mixed telemetry before detection, so the logic is written once against one schema. They are conceptually similar but not the same. **`NormalizedEvent` is NOT UDM.** It is a small educational schema (21 mostly flat fields, 6 event types), and its fields were not renamed to look like UDM.
 
 ## Google SecOps / YARA-L
 
-The executable detections in this lab are the **Python** ones in `src/detection_engine.py`. To show how the same detection-engineering ideas are expressed in Google SecOps, each one also has a **YARA-L 2.0 portfolio equivalent** written against Google's UDM:
+- **What runs:** the executable detection pipeline is the local Python code.
+- **What `detections/` contains:** YARA-L 2.0 versions of the same three behaviors, written against current Google SecOps documentation and Google's official example rules. They show how the same detection-engineering ideas are expressed against UDM-normalized telemetry.
 
 | Python detection | YARA-L 2.0 rule |
 |---|---|
@@ -349,92 +233,98 @@ The executable detections in this lab are the **Python** ones in `src/detection_
 | Suspicious PowerShell Execution | [`detections/suspicious_powershell.yaral`](detections/suspicious_powershell.yaral) |
 | Payload Download and Execution | [`detections/payload_download_execution.yaral`](detections/payload_download_execution.yaral) |
 
-The rules were written from current official Google SecOps documentation and Google's official example rules. They were **not** validated, deployed or run in a live Google SecOps tenant, because none was available. Only static checks of the files are performed (`tests/test_yaral_static.py`). The lab's own schema is **not** UDM: the rules use UDM fields, and the Python engine uses the local `NormalizedEvent`.
+The rules were **not** deployed to Google SecOps, **not** run in a tenant, and **not** checked with Google's `verifyRuleText` API. No tenant was available, and no official offline validator was found. Their field mappings depend on how each log source is parsed into UDM. [docs/google-secops.md](docs/google-secops.md) explains UDM and YARA-L, walks through each rule, and lists the assumptions, limitations and official references.
 
-[`docs/google-secops.md`](docs/google-secops.md) explains UDM and YARA-L, compares the local pipeline with Google SecOps, walks through each rule, and lists the limitations and the official references.
+## Threat Intelligence
 
-## Running Locally
+- **Mock provider (default):** deterministic and offline, so demos and tests are reproducible. Every result is labelled `Mock Threat Intelligence (simulated)` and carries `simulated: true`.
+- **AbuseIPDB (optional):** a real reputation lookup through `requests`.
+  - The API key comes from the `ABUSEIPDB_API_KEY` environment variable and is never stored, logged or exported.
+  - Lookups use an explicit timeout.
+  - Errors (authentication, rate limit, timeout, malformed JSON) become an `UNAVAILABLE` result instead of crashing the pipeline.
+  - Results are cached in memory per run.
+- **Never contacted by default:** there are no network requests unless `--threat-intel abuseipdb` is given.
+- **Only real public IPs are sent.** Private, loopback and documentation-range addresses are refused before any request.
+- **Context, not proof:** `MALICIOUS` does not prove compromise, and `UNKNOWN` does not mean benign.
 
-Requires Python 3.10+.
+## Risk Engine
 
-```bash
-cd secops-automation-lab
+| | Question |
+|---|---|
+| **Detection confidence** | How confident are we that the behavioral pattern occurred? |
+| **Incident risk** | How concerning is the incident, given the observed behavior and the available context? |
 
-# optional: create a virtual environment
-python -m venv .venv
-# Windows:      .venv\Scripts\activate
-# Linux/macOS:  source .venv/bin/activate
+The risk score is a deterministic sum of four capped categories:
 
-pip install -r requirements.txt
+| Category | Max points |
+|---|---|
+| detection evidence (confidence × 40) | 40 |
+| observed outcome (account access, execution, outbound connection) | 35 |
+| related activity (another detection, same host and user) | 15 |
+| threat intelligence | 10 |
 
-# timeline + detections + incidents
-python main.py
+The levels are LOW below 40, MEDIUM 40–59, HIGH 60–79 and CRITICAL 80+. Signals already counted in confidence are not counted again, and threat intelligence can never be the only reason for CRITICAL. The full model is in [docs/design.md](docs/design.md#risk-engine).
 
-# detections + incidents, no timeline
-python main.py --no-timeline
+## SOAR-Style Playbook
 
-# incident summaries only (risk, ATT&CK, threat intel, simulated playbook)
-python main.py --incidents-only
+The playbook turns each incident into deterministic actions: record the incident, escalate it to an analyst, and either **recommend** or **simulate** containment, depending on the risk level and the affected entities.
 
-# show one normalized event, detection or incident in full (IDs are printed in the output)
-python main.py --inspect 0910fc527510
-python main.py --inspect DET-7240d82770
-python main.py --inspect INC-a9f0935911
+| Detection | Possible containment |
+|---|---|
+| Credential attack | disable the account (only if a user is known), block the source IP (only if external) |
+| PowerShell or payload | isolate the endpoint (only if a host is known), block the external destinations |
 
-# also write normalized events, detections and incident reports to output/
-python main.py --export
-```
+Automated (simulated) containment requires CRITICAL risk **and** detection confidence ≥ 0.80. Otherwise containment is only recommended for analyst approval.
 
-**Offline demo** (default, mock threat intelligence, no network):
+**Every action is simulated.** `PlaybookAction.simulated` cannot be set to false, and no code path calls a firewall, EDR or identity system. In a real environment, actions such as isolating a production server or disabling a service account need business context and approval. A false positive there causes an outage.
 
-```bash
-python main.py --no-timeline
-```
-
-**Optional real provider** (AbuseIPDB; makes real HTTPS requests to api.abuseipdb.com):
-
-```bash
-# PowerShell
-$env:ABUSEIPDB_API_KEY = "<your key>"
-# bash/zsh
-export ABUSEIPDB_API_KEY="<your key>"
-
-python main.py --threat-intel abuseipdb --no-timeline      # enrich the dataset's detections
-python main.py --threat-intel abuseipdb --lookup-ip <public-ip>   # look up one real public IP
-```
-
-Dependencies: `requests` (used only by the optional AbuseIPDB provider) and `pytest` (tests).
-
-## Tests
+## Testing
 
 ```bash
-python -m pytest -v
+python -m pytest -v        # 286 tests, offline
 ```
 
-- `tests/test_normalizer.py`: each event type, raw-event preservation, missing or placeholder fields, rejection of unsupported events, multiple vendor formats and the bundled dataset.
-- `tests/test_detection_engine.py`: positive **and** negative scenarios for every detection. Negative cases include failures without success, success from a different IP or outside the window, too few accounts, admin PowerShell, Word without PowerShell, activity from another host or process, download without execution, mismatched paths and wrong ordering. It also checks that shuffled input gives the same result, that IDs are deterministic, and that the bundled dataset produces exactly three detections and none on benign hosts.
-- `tests/test_command_analysis.py`: PowerShell flag parsing, safe decoding of valid and invalid `-EncodedCommand` values (including a check that decoding never runs anything), and curl/wget/chmod/URL parsing.
-- `tests/test_mitre.py`: expected techniques per detection, names that match ATT&CK, evidence-based reasons, no duplicates, and techniques that are **not** added without supporting evidence.
-- `tests/test_threat_intel.py`: mock provider behavior and labelling. AbuseIPDB success, missing key, 401/403, 429, timeout, connection failure, malformed JSON, unexpected status and missing fields, all with **faked HTTP responses**. Also: non-public IPs are never sent, the API key never appears in output, and the cache calls the provider once per IP.
-- `tests/test_enrichment.py`: enrichment of all three detections, cache use for duplicate indicators, CLI offline default, missing-key behavior and export format.
-- `tests/test_risk_engine.py`: exact dataset scores, 0–100 bounds, determinism, thresholds, threat intelligence limited to context (including the CRITICAL cap), unknown or failed intelligence, confidence monotonicity, no double counting, and related-detection rules.
-- `tests/test_playbook.py`: the action policy for each level, the confidence gate for simulated automation, correct targets per detection, no account action without a user, no isolation without a host, no internal IP blocks, actions that can only be simulated, and a static check that the response modules have no system or network imports.
-- `tests/test_incident.py`: deterministic IDs and reports, composition, that all context survives (evidence, ATT&CK, threat intel, risk explanation, playbook), JSON validity, per-incident export files and the CLI.
+| Area | Files |
+|---|---|
+| normalization | `test_normalizer.py` |
+| command interpretation and safe PowerShell decoding | `test_command_analysis.py` |
+| behavioral detections, including negative and false-positive cases | `test_detection_engine.py` |
+| ATT&CK mapping, including techniques that must **not** be added | `test_mitre.py` |
+| threat intelligence, API failure handling, key safety, caching | `test_threat_intel.py`, `test_enrichment.py` |
+| risk scoring (bounds, determinism, no double counting, TI cap) | `test_risk_engine.py` |
+| playbook policy and safety | `test_playbook.py` |
+| incident reports and serialization | `test_incident.py` |
+| YARA-L files | `test_yaral_static.py` |
 
-- `tests/test_yaral_static.py`: **static** checks of the YARA-L files only. It checks that the files exist, the sections are present and in order, rule names are unique, the metadata and ATT&CK techniques are consistent, every event variable appears in `condition`, there are no placeholders, the disclaimer is present, and the docs reference each rule. It does **not** prove that Google SecOps accepts the rules.
+`tests/conftest.py` blocks network sockets for every test, and all AbuseIPDB tests use faked HTTP responses. The YARA-L tests are **static checks** (structure, metadata, consistency with the Python mappings, documentation). They do **not** show that Google SecOps accepts the rules.
 
-`tests/conftest.py` blocks all socket connections for every test, so the suite is guaranteed to run offline.
+## Security Design Principles
+
+- **Telemetry is untrusted data.** Command lines are parsed as strings and never executed or passed to a shell.
+- **PowerShell `-EncodedCommand` values may be decoded** for analyst context. The decoded text is only displayed, never evaluated.
+- **Simulated indicators are never contacted.** Attacker IPs and domains use documentation ranges and the reserved `.example` TLD.
+- **The default run is offline.** The only network code is the optional AbuseIPDB provider, used only on request.
+- **Credentials come from environment variables.** `.env` is git-ignored, and keys never appear in output or exceptions.
+- **Response actions are simulations.** There are no response APIs in the codebase.
+
+## Limitations
+
+- **Simulated data:** the telemetry is simulated and small, a single day with 45 events. Real data volume, noise and parsing problems are not represented.
+- **Simplified normalization:** 5 hand-written parsers, with domain names stripped from usernames, and no host-to-IP mapping (firewall events have no hostname).
+- **Illustrative scoring:** the confidence weights and risk weights are lab choices, not tuned on real data.
+- **No asset context:** there is no asset inventory or criticality, no user context and no business impact. Isolating a production web server is treated like any other host.
+- **No persistence:** there is no storage, case management or cross-run state, and the cache lasts for one run only.
+- **No real integrations:** there are no real response integrations; every action is simulated.
+- **Optional AbuseIPDB:** the AbuseIPDB integration is not needed for the demo. It was implemented from the API documentation and tested with faked responses.
+- **YARA-L is unvalidated:** the YARA-L rules need validation in a live Google SecOps tenant, and UDM field availability depends on the log source and its parser.
+- **Not production software:** this is an educational and portfolio lab, not production SOC software.
+
+## Documentation
+
+- [docs/design.md](docs/design.md): normalized schema, log sources, detection logic, confidence weights, correlation, ATT&CK mapping decisions, threat-intelligence and API handling, risk model, playbook policy, incident report format
+- [docs/google-secops.md](docs/google-secops.md): Google SecOps, UDM and YARA-L, comparison with the local pipeline, rule walkthroughs, limitations, official references
+- [docs/interview-guide.md](docs/interview-guide.md): technical Q&A about the design and a short demo flow
 
 ## Disclaimer
 
-- All telemetry is **simulated**. It does not come from real systems, users or incidents.
-- This is an **educational lab, not a production SIEM**.
-- The normalized schema is a small internal model. It takes inspiration from concepts such as principal/target, but it **is not Google SecOps UDM** and makes no claim of UDM compatibility.
-- The YARA-L rules are **portfolio examples**. They were written from official documentation but not compiled, verified, deployed or run in Google SecOps, and no Google SecOps results exist for them. There is **no integration** with Google SecOps.
-- Detections are **behavioral heuristics over simulated data**. They can produce false positives and false negatives, and they do not replace analyst review.
-- Telemetry is treated as data: command lines are parsed, **never executed**, and no simulated IP or domain is ever contacted.
-- **Mock threat intelligence is invented** for demonstration and is labelled as simulated everywhere. It says nothing about any real address. Real threat intelligence (optional) is context, not proof.
-- ATT&CK mappings describe behavior that matches documented techniques. They do not prove intent and are not a severity rating.
-- Risk scores and playbook decisions are **deterministic, illustrative policies** for a lab. They are not tuned for a real environment: a real SOC would also weigh asset criticality, business impact and approval workflows.
-- **All response actions are simulated.** No firewall rule, account, endpoint, process or network interface is ever changed, and no response API exists in the code.
-- The project runs locally, calls no external services and **does not modify any real infrastructure**.
+All telemetry, users, hosts and threat intelligence in this repository are **simulated**. The project does not monitor, query or modify any real system, other than the optional AbuseIPDB lookups you explicitly request.

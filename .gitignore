@@ -2,13 +2,26 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
 
 # Virtual environments
 .venv/
 venv/
 
-# Local secrets / environment
+# Local secrets / environment (the example file is tracked)
 .env
+.env.*
+!.env.example
 
 # Generated output (keep the folder itself)
 output/*

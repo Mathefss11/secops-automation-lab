@@ -227,4 +227,4 @@ Official Google example rules and tooling (`chronicle/detection-rules`, maintain
 - `rules/community/network/high_risk_user_download_executable_from_macro.yaral`
 - `tools/content_manager/README.md` (rule verification through the Google SecOps API)
 
-MITRE ATT&CK (tactics checked 2026-10-05): https://attack.mitre.org/tactics/TA0006/, https://attack.mitre.org/tactics/TA0002/, https://attack.mitre.org/tactics/TA0011/. Technique pages were verified in Phase 3 (see `src/mitre.py`).
+MITRE ATT&CK (tactics checked 2026-10-05): https://attack.mitre.org/tactics/TA0006/, https://attack.mitre.org/tactics/TA0002/, https://attack.mitre.org/tactics/TA0011/. Technique pages were verified when the ATT&CK mappings were written (see `src/mitre.py`).

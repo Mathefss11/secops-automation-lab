@@ -309,7 +309,7 @@ def export_incidents(incidents: list[Incident]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Normalize simulated security telemetry, detect and enrich.")
+    parser = argparse.ArgumentParser(description="Normalize simulated security telemetry, detect, enrich, score risk and evaluate simulated playbooks.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="raw events JSON file")
     parser.add_argument(
         "--inspect", metavar="ID", help="print one normalized event, detection (DET-...) or incident (INC-...) in full"

@@ -2,7 +2,7 @@
 
 Composition, not mutation: ``EnrichedDetection`` wraps the original Detection,
 which is left unchanged. Enrichment adds context; it never changes a
-detection's severity or confidence (scoring belongs to a later phase).
+detection's severity or confidence (incident risk is scored in src/risk_engine.py).
 """
 
 from __future__ import annotations
