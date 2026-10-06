@@ -1,0 +1,71 @@
+/*
+ * SecOps Automation Lab - portfolio / learning rule.
+ *
+ * YARA-L 2.0 equivalent of the local Python detection
+ * "Suspicious PowerShell Execution"
+ * (src/detection_engine.py: detect_suspicious_powershell).
+ *
+ * Written from the official Google SecOps YARA-L 2.0 and UDM documentation
+ * (see docs/google-secops.md). It has NOT been deployed to, compiled by or run
+ * in a Google SecOps tenant. Validate it in a tenant before any real use.
+ */
+
+rule suspicious_powershell_execution {
+
+  meta:
+    author = "SecOps Automation Lab (portfolio)"
+    description = "PowerShell started by an Office application with an encoded command or a hidden window, where the same PowerShell process then connects to an external IP within 5 minutes. PowerShell on its own, or encoded PowerShell on its own, does not match."
+    rule_name = "Suspicious PowerShell Execution"
+    severity = "Medium"
+    priority = "Medium"
+    tactic = "TA0002"
+    technique = "T1059.001"
+    data_source = "endpoint process and network telemetry parsed to UDM (for example Sysmon events 1, 3 and 11)"
+    assumption = "The parser populates principal.process (parent) and target.process (child) for PROCESS_LAUNCH, principal.process for NETWORK_CONNECTION and FILE_CREATION, and a stable product_specific_process_id (for example the Sysmon ProcessGuid)."
+    local_equivalent = "src/detection_engine.py detect_suspicious_powershell"
+    disclaimer = "Portfolio rule written from official documentation; not validated in a live Google SecOps tenant."
+
+  events:
+    // 1. PowerShell launched by an Office application (principal = parent, target = new process).
+    $powershell.metadata.event_type = "PROCESS_LAUNCH"
+    re.regex($powershell.principal.process.file.full_path, `\\(winword|excel|powerpnt|outlook|msaccess)\.exe$`) nocase
+    re.regex($powershell.target.process.file.full_path, `\\(powershell|pwsh)\.exe$`) nocase
+    // ...with an encoded command OR a hidden window (common spellings of each parameter).
+    (
+      re.regex($powershell.target.process.command_line, `\s[-/](e|ec|en|enc|encodedcommand)\s`) nocase or
+      re.regex($powershell.target.process.command_line, `\s[-/](w|win|window|windowstyle)\s+hidden\b`) nocase
+    )
+    $powershell.principal.hostname = $hostname
+    $powershell.target.process.product_specific_process_id = $powershell_process_id
+
+    // 2. The SAME PowerShell process connects to an IP outside private ranges.
+    $connection.metadata.event_type = "NETWORK_CONNECTION"
+    $connection.principal.hostname = $hostname
+    $connection.principal.process.product_specific_process_id = $powershell_process_id
+    not net.ip_in_range_cidr($connection.target.ip, "10.0.0.0/8")
+    not net.ip_in_range_cidr($connection.target.ip, "172.16.0.0/12")
+    not net.ip_in_range_cidr($connection.target.ip, "192.168.0.0/16")
+    not net.ip_in_range_cidr($connection.target.ip, "127.0.0.0/8")
+    $powershell.metadata.event_timestamp.seconds <= $connection.metadata.event_timestamp.seconds
+
+    // 3. Optional context: files written by the same PowerShell process.
+    $file_write.metadata.event_type = "FILE_CREATION"
+    $file_write.principal.hostname = $hostname
+    $file_write.principal.process.product_specific_process_id = $powershell_process_id
+
+  match:
+    $hostname, $powershell_process_id over 5m
+
+  outcome:
+    $principal_user_userid = array_distinct($powershell.principal.user.userid)
+    $parent_process_path = array_distinct($powershell.principal.process.file.full_path)
+    $powershell_command_line = array_distinct($powershell.target.process.command_line)
+    $external_destination_ips = array_distinct($connection.target.ip)
+    $created_file_paths = array_distinct($file_write.target.file.full_path)
+
+  condition:
+    // Launch context and an external connection are required.
+    // "#file_write >= 0" is an unbounded (optional) condition: created files are
+    // shown when present but are not required for the rule to match.
+    $powershell and $connection and #file_write >= 0
+}

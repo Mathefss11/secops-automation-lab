@@ -10,6 +10,7 @@ It is built in phases. The current version covers:
 - **Phase 2**: a behavioral detection engine that correlates normalized events into explainable detections
 - **Phase 3**: evidence-based MITRE ATT&CK mapping and threat-intelligence enrichment (offline mock by default, optional real AbuseIPDB API)
 - **Phase 4**: an explainable incident risk engine, a SOAR-style playbook with **simulated** response actions, and JSON incident reports
+- **Phase 5**: Google SecOps learning material: YARA-L 2.0 equivalents of the three detections and a UDM / YARA-L mapping document (written from official documentation, **not validated in a live tenant**)
 
 There is no web UI, database or cloud service. The only external API is optional and is never contacted unless explicitly requested.
 
@@ -47,6 +48,8 @@ SOAR-style Playbook                src/playbook.py   (simulated actions only)
    ↓
 Incident Report                    CLI + output/incidents/INC-*.json (main.py)
 ```
+
+Alongside the executable Python pipeline, `detections/*.yaral` contains YARA-L 2.0 portfolio equivalents of the three detections for Google SecOps. See [Google SecOps / YARA-L](#google-secops--yara-l).
 
 ## Why Normalize Security Events?
 
@@ -336,6 +339,20 @@ Each detection becomes one `Incident` (`src/incident.py`). It wraps the enriched
 - `recommendations` (actions that need approval) and `playbook_actions` (all actions)
 - `simulated_response: true` and a disclaimer
 
+## Google SecOps / YARA-L
+
+The executable detections in this lab are the **Python** ones in `src/detection_engine.py`. To show how the same detection-engineering ideas are expressed in Google SecOps, each one also has a **YARA-L 2.0 portfolio equivalent** written against Google's UDM:
+
+| Python detection | YARA-L 2.0 rule |
+|---|---|
+| Credential Attack Followed by Successful Authentication | [`detections/credential_attack.yaral`](detections/credential_attack.yaral) |
+| Suspicious PowerShell Execution | [`detections/suspicious_powershell.yaral`](detections/suspicious_powershell.yaral) |
+| Payload Download and Execution | [`detections/payload_download_execution.yaral`](detections/payload_download_execution.yaral) |
+
+The rules were written from current official Google SecOps documentation and Google's official example rules. They were **not** validated, deployed or run in a live Google SecOps tenant, because none was available. Only static checks of the files are performed (`tests/test_yaral_static.py`). The lab's own schema is **not** UDM: the rules use UDM fields, and the Python engine uses the local `NormalizedEvent`.
+
+[`docs/google-secops.md`](docs/google-secops.md) explains UDM and YARA-L, compares the local pipeline with Google SecOps, walks through each rule, and lists the limitations and the official references.
+
 ## Running Locally
 
 Requires Python 3.10+.
@@ -404,6 +421,8 @@ python -m pytest -v
 - `tests/test_playbook.py`: the action policy for each level, the confidence gate for simulated automation, correct targets per detection, no account action without a user, no isolation without a host, no internal IP blocks, actions that can only be simulated, and a static check that the response modules have no system or network imports.
 - `tests/test_incident.py`: deterministic IDs and reports, composition, that all context survives (evidence, ATT&CK, threat intel, risk explanation, playbook), JSON validity, per-incident export files and the CLI.
 
+- `tests/test_yaral_static.py`: **static** checks of the YARA-L files only. It checks that the files exist, the sections are present and in order, rule names are unique, the metadata and ATT&CK techniques are consistent, every event variable appears in `condition`, there are no placeholders, the disclaimer is present, and the docs reference each rule. It does **not** prove that Google SecOps accepts the rules.
+
 `tests/conftest.py` blocks all socket connections for every test, so the suite is guaranteed to run offline.
 
 ## Disclaimer
@@ -411,6 +430,7 @@ python -m pytest -v
 - All telemetry is **simulated**. It does not come from real systems, users or incidents.
 - This is an **educational lab, not a production SIEM**.
 - The normalized schema is a small internal model. It takes inspiration from concepts such as principal/target, but it **is not Google SecOps UDM** and makes no claim of UDM compatibility.
+- The YARA-L rules are **portfolio examples**. They were written from official documentation but not compiled, verified, deployed or run in Google SecOps, and no Google SecOps results exist for them. There is **no integration** with Google SecOps.
 - Detections are **behavioral heuristics over simulated data**. They can produce false positives and false negatives, and they do not replace analyst review.
 - Telemetry is treated as data: command lines are parsed, **never executed**, and no simulated IP or domain is ever contacted.
 - **Mock threat intelligence is invented** for demonstration and is labelled as simulated everywhere. It says nothing about any real address. Real threat intelligence (optional) is context, not proof.

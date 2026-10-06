@@ -1,0 +1,86 @@
+/*
+ * SecOps Automation Lab - portfolio / learning rule.
+ *
+ * YARA-L 2.0 equivalent of the local Python detection
+ * "Payload Download and Execution"
+ * (src/detection_engine.py: detect_payload_execution).
+ *
+ * Written from the official Google SecOps YARA-L 2.0 and UDM documentation
+ * (see docs/google-secops.md). It has NOT been deployed to, compiled by or run
+ * in a Google SecOps tenant. Validate it in a tenant before any real use.
+ */
+
+rule payload_download_and_execution {
+
+  meta:
+    author = "SecOps Automation Lab (portfolio)"
+    description = "On one Linux host and for one user: curl or wget writes a file from a non-local URL, execute permission is added to that same file, and that same file is then executed, all within 15 minutes. A download without execution does not match."
+    rule_name = "Payload Download and Execution"
+    severity = "High"
+    priority = "High"
+    tactic = "TA0011"
+    technique = "T1105"
+    platform = "Linux"
+    data_source = "Linux endpoint process and file telemetry parsed to UDM (for example an EDR or auditd)"
+    assumption = "The source records the curl/wget command line, a FILE_MODIFICATION event for the permission change with principal.process set to chmod, and PROCESS_LAUNCH events whose target.process.file.full_path is the executed file."
+    local_equivalent = "src/detection_engine.py detect_payload_execution"
+    disclaimer = "Portfolio rule written from official documentation; not validated in a live Google SecOps tenant."
+
+  events:
+    // 1. DOWNLOAD: curl or wget writes to an absolute path.
+    //    The capture group extracts PATH from "curl -o PATH", "curl --output PATH",
+    //    "wget -O PATH", "wget --output-document=PATH" and clustered flags like "-sLo PATH".
+    $download.metadata.event_type = "PROCESS_LAUNCH"
+    re.regex($download.target.process.file.full_path, `/(curl|wget)$`)
+    re.regex($download.target.process.command_line, `(ftp|https?)://`) nocase
+    // Exclude downloads from localhost and private ranges (internal tooling).
+    not re.regex($download.target.process.command_line, `://(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)`) nocase
+    $payload_path = re.capture($download.target.process.command_line, `(?:^|\s)(?:-[A-Za-z]*[oO]|--output|--output-document)(?:\s+|=)(/[^\s'"]+)`)
+    $download.principal.hostname = $hostname
+    $download.principal.user.userid = $user
+
+    // 2. PERMISSION: chmod changes the mode of the same file.
+    $permission_change.metadata.event_type = "FILE_MODIFICATION"
+    re.regex($permission_change.principal.process.file.full_path, `/chmod$`)
+    $permission_change.target.file.full_path = $payload_path
+    $permission_change.principal.hostname = $hostname
+    $permission_change.principal.user.userid = $user
+
+    // 3. EXECUTION: the same file is started as a process. Required: a download
+    //    on its own is never treated as execution.
+    $execution.metadata.event_type = "PROCESS_LAUNCH"
+    $execution.target.process.file.full_path = $payload_path
+    $execution.principal.hostname = $hostname
+    $execution.principal.user.userid = $user
+
+    // Order: download, then permission change, then execution.
+    $download.metadata.event_timestamp.seconds <= $permission_change.metadata.event_timestamp.seconds
+    $permission_change.metadata.event_timestamp.seconds <= $execution.metadata.event_timestamp.seconds
+
+    // 4. Optional context: the executed file connects to an external IP.
+    $outbound.metadata.event_type = "NETWORK_CONNECTION"
+    $outbound.principal.hostname = $hostname
+    $outbound.principal.process.file.full_path = $payload_path
+    not net.ip_in_range_cidr($outbound.target.ip, "10.0.0.0/8")
+    not net.ip_in_range_cidr($outbound.target.ip, "172.16.0.0/12")
+    not net.ip_in_range_cidr($outbound.target.ip, "192.168.0.0/16")
+    not net.ip_in_range_cidr($outbound.target.ip, "127.0.0.0/8")
+    $execution.metadata.event_timestamp.seconds <= $outbound.metadata.event_timestamp.seconds
+
+  match:
+    $hostname, $user over 15m
+
+  outcome:
+    $downloaded_file_path = array_distinct($payload_path)
+    $download_command_line = array_distinct($download.target.process.command_line)
+    $executing_parent_process = array_distinct($execution.principal.process.file.full_path)
+    $external_destination_ips = array_distinct($outbound.target.ip)
+    $first_download_time = min($download.metadata.event_timestamp.seconds)
+    $first_execution_time = min($execution.metadata.event_timestamp.seconds)
+
+  condition:
+    // Download, permission change and execution are required.
+    // "#outbound >= 0" is unbounded (optional): a later external connection is
+    // reported when present but is not required.
+    $download and $permission_change and $execution and #outbound >= 0
+}
